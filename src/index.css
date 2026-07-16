@@ -1,0 +1,162 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface-base: #1a1d23;
+  --color-surface-sidebar: #14161a;
+  --color-surface-elevated: #22262e;
+  --color-border: #2e3340;
+  --color-text-primary: #e8eaed;
+  --color-text-secondary: #8b919a;
+  --color-accent: #4a7fd4;
+  --color-accent-warm: #c4923a;
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+:root {
+  --surface-base: #1a1d23;
+  --surface-sidebar: #14161a;
+  --surface-elevated: #22262e;
+  --border: #2e3340;
+  --text-primary: #e8eaed;
+  --text-secondary: #8b919a;
+  --accent: #4a7fd4;
+  --accent-warm: #c4923a;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+  font-size: 17px;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: var(--font-sans);
+  background-color: var(--surface-base);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+/* Checkerboard for texture transparency previews */
+.bg-checkerboard {
+  background-color: #1a1d23;
+  background-image:
+    linear-gradient(45deg, #22262e 25%, transparent 25%),
+    linear-gradient(-45deg, #22262e 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #22262e 75%),
+    linear-gradient(-45deg, transparent 75%, #22262e 75%);
+  background-size: 12px 12px;
+  background-position:
+    0 0,
+    0 6px,
+    6px -6px,
+    -6px 0;
+}
+
+/* Tree connecting lines */
+.tree-root {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tree-branch {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 1rem;
+  margin-left: 0.5rem;
+  border-left: 1px solid var(--border);
+}
+
+.tree-item {
+  position: relative;
+}
+
+.tree-item::before {
+  content: "";
+  position: absolute;
+  left: -1rem;
+  top: 0.85rem;
+  width: 0.75rem;
+  height: 1px;
+  background: var(--border);
+}
+
+.tree-root > .tree-item::before {
+  display: none;
+}
+
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes cube-assemble {
+  0% {
+    opacity: 0;
+    stroke-dashoffset: 40;
+  }
+  100% {
+    opacity: 1;
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes cube-face-in {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in 0.2s ease-out;
+}
+
+.wireframe-cube-edge {
+  stroke-dasharray: 40;
+  stroke-dashoffset: 40;
+  animation: cube-assemble 1s ease-out forwards;
+}
+
+.wireframe-cube-edge:nth-child(1) { animation-delay: 0ms; }
+.wireframe-cube-edge:nth-child(2) { animation-delay: 60ms; }
+.wireframe-cube-edge:nth-child(3) { animation-delay: 120ms; }
+.wireframe-cube-edge:nth-child(4) { animation-delay: 180ms; }
+.wireframe-cube-edge:nth-child(5) { animation-delay: 240ms; }
+.wireframe-cube-edge:nth-child(6) { animation-delay: 300ms; }
+.wireframe-cube-edge:nth-child(7) { animation-delay: 360ms; }
+.wireframe-cube-edge:nth-child(8) { animation-delay: 420ms; }
+.wireframe-cube-edge:nth-child(9) { animation-delay: 480ms; }
+.wireframe-cube-edge:nth-child(10) { animation-delay: 540ms; }
+.wireframe-cube-edge:nth-child(11) { animation-delay: 600ms; }
+.wireframe-cube-edge:nth-child(12) { animation-delay: 660ms; }
+
+.wireframe-cube-face {
+  opacity: 0;
+  animation: cube-face-in 0.3s ease-out 0.7s forwards;
+}
