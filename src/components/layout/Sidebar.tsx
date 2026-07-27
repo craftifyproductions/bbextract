@@ -1,3 +1,5 @@
+import { StorageBar } from './StorageBar'
+
 export type AppView = 'upload' | 'dashboard' | 'files'
 
 interface SidebarProps {
@@ -65,6 +67,8 @@ export function Sidebar({
           })}
         </ul>
       </nav>
+
+      <StorageBar authenticated={authenticated} />
 
       {authenticated && onLogout ? (
         <div className="border-t border-border px-3 py-4 max-md:hidden">

@@ -29,11 +29,17 @@ function App() {
 
   const {
     queueInfo,
+    uploadInfo,
     isProcessing,
+    isUploading,
+    activeProcessingId,
+    getProgress,
     setProgress,
     clearProgress,
     setQueuePosition,
     clearQueue,
+    setUploadProgress,
+    clearUploadProgress,
     setActiveProcessingId,
   } = useProcessingProgress()
 
@@ -58,17 +64,37 @@ function App() {
     [],
   )
 
-  const { processFiles } = useFileProcessor(
+  const handleProcessingError = useCallback(
+    (error: { message: string; severity?: 'error' | 'warning' | 'info' }) => {
+      const type =
+        error.severity === 'warning'
+          ? 'warning'
+          : error.severity === 'info'
+            ? 'info'
+            : 'error'
+      showToast(error.message, type)
+    },
+    [showToast],
+  )
+
+  const {
+    processFiles,
+    prepareUpload,
+    beginUploadSession,
+    cancelUpload,
+    isUploadActive,
+    isUploadCancelled,
+  } = useFileProcessor(
     addModel,
     commitModel,
-    (error) => {
-      showToast(error.message, 'error')
-    },
+    handleProcessingError,
     {
       setProgress,
       clearProgress,
       setQueuePosition,
       clearQueue,
+      setUploadProgress,
+      clearUploadProgress,
       setActiveProcessingId,
     },
     consoleApi,
@@ -120,6 +146,31 @@ function App() {
     [processFiles],
   )
 
+  const handleUploadReject = useCallback(
+    (message: string) => {
+      if (message === 'Upload cancelled') {
+        showToast('Upload cancelled', 'success')
+        return
+      }
+      showToast(message, 'error')
+    },
+    [showToast],
+  )
+
+  const handleCancelUpload = useCallback(() => {
+    cancelUpload()
+    showToast('Upload cancelled', 'success')
+  }, [cancelUpload, showToast])
+
+  const dropZoneProps = {
+    onFiles: handleFiles,
+    onPrepareUpload: prepareUpload,
+    onBeginUploadSession: beginUploadSession,
+    onCancelUpload: isUploadActive ? handleCancelUpload : undefined,
+    isUploadCancelled,
+    onReject: handleUploadReject,
+  }
+
   const handleCloseDetail = useCallback(() => {
     setSelectedId(null)
   }, [setSelectedId])
@@ -127,6 +178,9 @@ function App() {
   const hasModels = models.length > 0
   const doneCount = models.filter((m) => m.status === 'done').length
   const showingDetail = Boolean(selectedModel && selectedModel.status === 'done')
+  const activeProcessingModel = activeProcessingId
+    ? models.find((model) => model.id === activeProcessingId)
+    : undefined
 
   const renderProtectedContent = () => {
     if (showingDetail && selectedModel) {
@@ -140,6 +194,10 @@ function App() {
         hasModels={hasModels}
         doneCount={doneCount}
         onClear={clearModels}
+        onViewDetails={setSelectedId}
+        getProgress={getProgress}
+        queueInfo={queueInfo}
+        activeProcessingId={activeProcessingId}
         onLogRefresh={(refresh) => {
           logsRefreshRef.current = refresh
         }}
@@ -166,11 +224,11 @@ function App() {
           </div>
           {!hasModels ? (
             <EmptyState centered>
-              <DropZone onFiles={handleFiles} onReject={(message) => showToast(message, 'error')} />
+              <DropZone {...dropZoneProps} />
             </EmptyState>
           ) : (
             <div className="flex flex-1 items-center justify-center">
-              <DropZone onFiles={handleFiles} onReject={(message) => showToast(message, 'error')} />
+              <DropZone {...dropZoneProps} compact />
             </div>
           )}
         </div>
@@ -218,8 +276,19 @@ function App() {
           authenticated={authenticated}
           onLogout={() => void logout()}
           banner={
-            isProcessing && queueInfo && queueInfo.total > 0 ? (
-              <ProcessingBanner queueInfo={queueInfo} />
+            isUploadActive ||
+            (isProcessing && queueInfo && queueInfo.total > 0) ||
+            (isUploading && uploadInfo && uploadInfo.total > 0) ? (
+              <ProcessingBanner
+                queueInfo={queueInfo}
+                uploadInfo={uploadInfo}
+                activeProcessingId={activeProcessingId}
+                getProgress={getProgress}
+                currentFilename={activeProcessingModel?.originalFilename}
+                onCancel={
+                  isUploadActive || isProcessing || isUploading ? handleCancelUpload : undefined
+                }
+              />
             ) : null
           }
         >

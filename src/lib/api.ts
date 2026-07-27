@@ -1,3 +1,5 @@
+import { fetchWithRetry } from './fetchWithRetry'
+
 const API_BASE = ''
 
 export class ApiError extends Error {
@@ -51,7 +53,7 @@ async function binaryRequest(path: string, options: RequestInit = {}): Promise<R
   const headers = new Headers(options.headers)
   if (token) headers.set('Authorization', `Bearer ${token}`)
 
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetchWithRetry(`${API_BASE}${path}`, {
     ...options,
     credentials: 'include',
     headers,
@@ -165,4 +167,25 @@ export async function uploadR2File(
 export async function downloadR2File(storagePath: string): Promise<Blob> {
   const response = await binaryRequest(`/api/r2/file?path=${encodeURIComponent(storagePath)}`)
   return response.blob()
+}
+
+export interface R2DeleteResponse {
+  ok: boolean
+  storagePath?: string
+  prefix?: string
+  deletedCount?: number
+}
+
+export async function deleteR2File(storagePath: string): Promise<R2DeleteResponse> {
+  const response = await binaryRequest(`/api/r2/file?path=${encodeURIComponent(storagePath)}`, {
+    method: 'DELETE',
+  })
+  return response.json() as Promise<R2DeleteResponse>
+}
+
+export async function deleteR2Prefix(prefix: string): Promise<R2DeleteResponse> {
+  const response = await binaryRequest(`/api/r2/prefix?prefix=${encodeURIComponent(prefix)}`, {
+    method: 'DELETE',
+  })
+  return response.json() as Promise<R2DeleteResponse>
 }

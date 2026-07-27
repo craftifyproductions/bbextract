@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { MouseEvent } from 'react'
 import {
+  deleteStoredFile,
+  deleteStoredFolder,
   downloadStoredExtractedFile,
   downloadStoredFolderZip,
   getStoredFilePreviewUrl,
@@ -400,6 +402,30 @@ export function FileManagerView() {
             const nextName = window.prompt('Rename folder', folder.rawName)
             if (nextName) void runAction(() => renameStoredFolder(folder.path, nextName, files))
           }}
+          onDeleteFile={(file) => {
+            const confirmed = window.confirm(
+              `Delete "${file.filename}"?\n\nThis removes the file from storage and cannot be undone.`,
+            )
+            if (!confirmed) return
+            void runAction(async () => {
+              await deleteStoredFile(file)
+              if (editor?.file.storagePath === file.storagePath) setEditor(null)
+            })
+          }}
+          onDeleteFolder={(folder) => {
+            const folderFiles = files.filter((file) => file.storagePath.startsWith(`${folder.path}/`))
+            const confirmed = window.confirm(
+              `Delete folder "${folder.name}" and ${folderFiles.length} file${folderFiles.length === 1 ? '' : 's'}?\n\nThis removes everything inside from storage and cannot be undone.`,
+            )
+            if (!confirmed) return
+            void runAction(async () => {
+              await deleteStoredFolder(folder.path, files)
+              if (editor && editor.file.storagePath.startsWith(`${folder.path}/`)) setEditor(null)
+              if (currentPath === folder.path || currentPath.startsWith(`${folder.path}/`)) {
+                setCurrentPath(parentPath(folder.path))
+              }
+            })
+          }}
         />
       ) : null}
 
@@ -509,6 +535,8 @@ function ContextMenu({
   onDownloadFolder,
   onRenameFile,
   onRenameFolder,
+  onDeleteFile,
+  onDeleteFolder,
 }: {
   state: ContextMenuState
   files: StoredExtractedFile[]
@@ -518,6 +546,8 @@ function ContextMenu({
   onDownloadFolder: (path: string) => void
   onRenameFile: (file: StoredExtractedFile) => void
   onRenameFolder: (folder: FolderEntry) => void
+  onDeleteFile: (file: StoredExtractedFile) => void
+  onDeleteFolder: (folder: FolderEntry) => void
 }) {
   let menuItems
   if (state.entry.type === 'folder') {
@@ -529,6 +559,7 @@ function ContextMenu({
         onOpenFolder={onOpenFolder}
         onDownloadFolder={onDownloadFolder}
         onRenameFolder={onRenameFolder}
+        onDeleteFolder={onDeleteFolder}
       />
     )
   } else {
@@ -539,6 +570,7 @@ function ContextMenu({
         onEditFile={onEditFile}
         onDownloadFile={onDownloadFile}
         onRenameFile={onRenameFile}
+        onDeleteFile={onDeleteFile}
       />
     )
   }
@@ -560,12 +592,14 @@ function FolderMenuItems({
   onOpenFolder,
   onDownloadFolder,
   onRenameFolder,
+  onDeleteFolder,
 }: {
   folder: FolderEntry
   hasFiles: boolean
   onOpenFolder: (path: string) => void
   onDownloadFolder: (path: string) => void
   onRenameFolder: (folder: FolderEntry) => void
+  onDeleteFolder: (folder: FolderEntry) => void
 }) {
   return (
     <>
@@ -573,6 +607,9 @@ function FolderMenuItems({
       <MenuItem onClick={() => onRenameFolder(folder)}>Rename</MenuItem>
       <MenuItem disabled={!hasFiles} onClick={() => onDownloadFolder(folder.path)}>
         Download ZIP
+      </MenuItem>
+      <MenuItem variant="danger" disabled={!hasFiles} onClick={() => onDeleteFolder(folder)}>
+        Delete folder
       </MenuItem>
     </>
   )
@@ -583,11 +620,13 @@ function FileMenuItems({
   onEditFile,
   onDownloadFile,
   onRenameFile,
+  onDeleteFile,
 }: {
   file: StoredExtractedFile
   onEditFile: (file: StoredExtractedFile) => void
   onDownloadFile: (file: StoredExtractedFile) => void
   onRenameFile: (file: StoredExtractedFile) => void
+  onDeleteFile: (file: StoredExtractedFile) => void
 }) {
   return (
     <>
@@ -595,6 +634,9 @@ function FileMenuItems({
       <MenuItem onClick={() => onRenameFile(file)}>Rename</MenuItem>
       <MenuItem disabled={!isEditable(file)} onClick={() => onEditFile(file)}>
         Edit
+      </MenuItem>
+      <MenuItem variant="danger" onClick={() => onDeleteFile(file)}>
+        Delete
       </MenuItem>
     </>
   )
@@ -604,17 +646,23 @@ function MenuItem({
   children,
   onClick,
   disabled = false,
+  variant = 'default',
 }: {
   children: string
   onClick: () => void
   disabled?: boolean
+  variant?: 'default' | 'danger'
 }) {
   return (
     <button
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className="block w-full px-3 py-2 text-left text-sm text-text-secondary transition-colors hover:bg-surface-base hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
+      className={`block w-full px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+        variant === 'danger'
+          ? 'text-red-400 hover:bg-red-500/10 hover:text-red-300'
+          : 'text-text-secondary hover:bg-surface-base hover:text-text-primary'
+      }`}
     >
       {children}
     </button>

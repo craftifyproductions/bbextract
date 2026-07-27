@@ -5,6 +5,11 @@ import type { DirectUploadAssetKind, UploadItem } from '../../lib/types'
 interface DropZoneProps {
   onFiles: (files: UploadItem[]) => void
   onReject: (message: string) => void
+  /** Run storage/session checks before ZIP extraction begins (fail fast). */
+  onPrepareUpload?: () => Promise<boolean>
+  onBeginUploadSession?: () => void
+  onCancelUpload?: () => void
+  isUploadCancelled?: () => boolean
   disabled?: boolean
   compact?: boolean
 }
@@ -98,7 +103,9 @@ function markBatchComplete(items: UploadItem[]): UploadItem[] {
 async function extractZipInChunks(
   file: File,
   emitItems: (items: UploadItem[]) => void,
-): Promise<{ accepted: number; skipped: number }> {
+  onProgress?: (done: number, total: number) => void,
+  shouldCancel?: () => boolean,
+): Promise<{ accepted: number; skipped: number; cancelled: boolean }> {
   const reader = new ZipReader(new BlobReader(file))
   let accepted = 0
   let skipped = 0
@@ -116,7 +123,17 @@ async function extractZipInChunks(
     const entries = await reader.getEntries()
     entries.sort((a, b) => a.filename.localeCompare(b.filename))
 
+    const totalEntries = entries.length
+    let processedEntries = 0
+    onProgress?.(0, totalEntries)
+
     for (const entry of entries) {
+      if (shouldCancel?.()) {
+        return { accepted, skipped, cancelled: true }
+      }
+
+      processedEntries += 1
+      onProgress?.(processedEntries, totalEntries)
       if (entry.directory || !entry.getData) continue
 
       const type = fileTypeForName(entry.filename)
@@ -159,13 +176,25 @@ async function extractZipInChunks(
     await reader.close()
   }
 
-  return { accepted, skipped }
+  return { accepted, skipped, cancelled: false }
 }
 
-export function DropZone({ onFiles, onReject, disabled = false, compact = false }: DropZoneProps) {
+export function DropZone({
+  onFiles,
+  onReject,
+  onPrepareUpload,
+  onBeginUploadSession,
+  onCancelUpload,
+  isUploadCancelled,
+  disabled = false,
+  compact = false,
+}: DropZoneProps) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [dragOver, setDragOver] = useState(false)
   const [expanding, setExpanding] = useState(false)
+  const [extractProgress, setExtractProgress] = useState<{ done: number; total: number } | null>(
+    null,
+  )
 
   const handleFiles = useCallback(
     async (fileList: FileList | File[]) => {
@@ -180,8 +209,10 @@ export function DropZone({ onFiles, onReject, disabled = false, compact = false 
       }
 
       setExpanding(true)
+      onBeginUploadSession?.()
       let accepted = 0
       let skipped = unsupportedDirectFiles.length
+      let cancelled = false
 
       try {
         const directItems = directFiles
@@ -193,21 +224,52 @@ export function DropZone({ onFiles, onReject, disabled = false, compact = false 
         }
 
         for (const file of zipFiles) {
-          const result = await extractZipInChunks(file, (items) => {
-            accepted += items.length
-            onFiles(items)
-          })
+          if (isUploadCancelled?.()) {
+            cancelled = true
+            break
+          }
+
+          if (onPrepareUpload) {
+            const ready = await onPrepareUpload()
+            if (!ready) {
+              setExpanding(false)
+              setExtractProgress(null)
+              return
+            }
+          }
+
+          setExtractProgress({ done: 0, total: 0 })
+          const result = await extractZipInChunks(
+            file,
+            (items) => {
+              if (isUploadCancelled?.()) return
+              accepted += items.length
+              onFiles(items)
+            },
+            (done, total) => setExtractProgress({ done, total }),
+            isUploadCancelled,
+          )
           skipped += result.skipped
+          if (result.cancelled) {
+            cancelled = true
+            break
+          }
           if (result.accepted === 0) skipped += 1
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to read ZIP file'
         onReject(`Could not extract ZIP - ${message}`)
         setExpanding(false)
+        setExtractProgress(null)
         return
       }
 
       setExpanding(false)
+      setExtractProgress(null)
+
+      if (cancelled || isUploadCancelled?.()) {
+        return
+      }
 
       if (accepted === 0) {
         onReject('Only .bbmodel files or ZIPs containing .bbmodel, .json, or texture files are accepted')
@@ -218,7 +280,7 @@ export function DropZone({ onFiles, onReject, disabled = false, compact = false 
         onReject(`${skipped} unsupported or empty file(s) skipped`)
       }
     },
-    [onFiles, onReject],
+    [isUploadCancelled, onBeginUploadSession, onFiles, onPrepareUpload, onReject],
   )
 
   return (
@@ -271,11 +333,53 @@ export function DropZone({ onFiles, onReject, disabled = false, compact = false 
       <h3 className={`font-medium text-text-primary ${compact ? 'text-sm' : 'text-base sm:text-lg'}`}>
         Drop .bbmodel or ZIP files here
       </h3>
-      <p className={`mt-2 text-text-secondary ${compact ? 'text-xs' : 'text-sm'}`}>
-        {expanding
-          ? 'Extracting ZIP archive in chunks...'
-          : 'or click to browse - ZIPs can include models, JSON, and textures'}
-      </p>
+      {expanding && extractProgress ? (
+        <div className="mx-auto mt-3 w-full max-w-xs">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="font-mono text-xs text-accent-warm">
+              {extractProgress.total > 0
+                ? `Extracting ${extractProgress.done} of ${extractProgress.total}…`
+                : 'Reading ZIP archive…'}
+            </span>
+            {extractProgress.total > 0 ? (
+              <span className="font-mono text-xs text-text-secondary">
+                {Math.round((extractProgress.done / extractProgress.total) * 100)}%
+              </span>
+            ) : null}
+          </div>
+          <div className="h-1 overflow-hidden rounded-sm bg-surface-base">
+            <div
+              className="h-full bg-accent-warm transition-all duration-300 ease-out"
+              style={{
+                width:
+                  extractProgress.total > 0
+                    ? `${(extractProgress.done / extractProgress.total) * 100}%`
+                    : '100%',
+              }}
+            />
+          </div>
+          {onCancelUpload ? (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation()
+                onCancelUpload()
+              }}
+              className="mt-3 w-full rounded border border-border px-3 py-1.5 text-xs text-text-secondary transition-colors hover:border-red-500/50 hover:bg-surface-base hover:text-red-300"
+            >
+              Cancel upload
+            </button>
+          ) : null}
+        </div>
+      ) : expanding ? (
+        <p className={`mt-2 text-text-secondary ${compact ? 'text-xs' : 'text-sm'}`}>
+          Extracting ZIP archive in chunks...
+        </p>
+      ) : (
+        <p className={`mt-2 text-text-secondary ${compact ? 'text-xs' : 'text-sm'}`}>
+          or click to browse - ZIPs can include models, JSON, and textures
+        </p>
+      )}
     </div>
   )
 }

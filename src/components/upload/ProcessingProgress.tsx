@@ -9,7 +9,7 @@ const STAGE_PROGRESS: Record<ProcessingStage, number> = {
   error: 100,
 }
 
-function getStageLabel(stage: ProcessingStage, detail?: ProcessingProgressDetail): string {
+export function getStageLabel(stage: ProcessingStage, detail?: ProcessingProgressDetail): string {
   switch (stage) {
     case 'parsing':
       return detail?.elementCount
@@ -32,6 +32,17 @@ function getStageLabel(stage: ProcessingStage, detail?: ProcessingProgressDetail
     case 'error':
       return 'Error'
   }
+}
+
+export function getQueueProcessingPercent(
+  current: number,
+  total: number,
+  stage: ProcessingStage,
+): number {
+  if (total <= 0) return 0
+  const fileIndex = Math.max(0, Math.min(current - 1, total - 1))
+  const withinFile = STAGE_PROGRESS[stage] / 100
+  return Math.round(((fileIndex + withinFile) / total) * 100)
 }
 
 interface ProcessingProgressProps {

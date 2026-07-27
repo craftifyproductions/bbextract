@@ -3,6 +3,11 @@ import type { Request, Response, NextFunction } from 'express'
 import { createClient } from '@supabase/supabase-js'
 import { PASSWORD, SUPABASE_ANON_KEY, SUPABASE_URL } from './config.js'
 
+export interface AuthenticatedSupabaseUser {
+  id: string
+  email: string | null
+}
+
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (req.session?.authenticated) {
     next()
@@ -30,6 +35,20 @@ function getBearerToken(req: Request): string | null {
   return token || null
 }
 
+export async function resolveSupabaseUser(req: Request): Promise<AuthenticatedSupabaseUser | null> {
+  const token = getBearerToken(req)
+  const supabase = getSupabaseAuthClient()
+  if (!token || !supabase) return null
+
+  const { data, error } = await supabase.auth.getUser(token)
+  if (error || !data.user) return null
+
+  return {
+    id: data.user.id,
+    email: data.user.email ?? null,
+  }
+}
+
 export async function requireStorageAuth(
   req: Request,
   res: Response,
@@ -40,15 +59,8 @@ export async function requireStorageAuth(
     return
   }
 
-  const token = getBearerToken(req)
-  const supabase = getSupabaseAuthClient()
-  if (!token || !supabase) {
-    res.status(401).json({ error: 'Authentication required' })
-    return
-  }
-
-  const { data, error } = await supabase.auth.getUser(token)
-  if (error || !data.user) {
+  const user = await resolveSupabaseUser(req)
+  if (!user) {
     res.status(401).json({ error: 'Authentication required' })
     return
   }

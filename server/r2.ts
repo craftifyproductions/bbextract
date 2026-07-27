@@ -1,8 +1,11 @@
 import { Readable } from 'node:stream'
 import type { Request, Response } from 'express'
 import {
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadBucketCommand,
+  ListObjectsV2Command,
   S3Client,
 } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
@@ -135,6 +138,86 @@ export async function healthR2Handler(_req: Request, res: Response): Promise<voi
       ok: false,
       configured: isR2Configured(),
       error: 'Cloudflare R2 health check failed',
+    })
+  }
+}
+
+async function deleteR2ObjectsByPrefix(prefix: string): Promise<number> {
+  const client = getR2Client()
+  const keyPrefix = objectKey(prefix.endsWith('/') ? prefix : `${prefix}/`)
+  let deletedCount = 0
+  let continuationToken: string | undefined
+
+  do {
+    const listing = await client.send(
+      new ListObjectsV2Command({
+        Bucket: R2_BUCKET!,
+        Prefix: keyPrefix,
+        ContinuationToken: continuationToken,
+      }),
+    )
+
+    const keys = (listing.Contents ?? [])
+      .map((entry) => entry.Key)
+      .filter((key): key is string => Boolean(key))
+
+    if (keys.length > 0) {
+      await client.send(
+        new DeleteObjectsCommand({
+          Bucket: R2_BUCKET!,
+          Delete: {
+            Objects: keys.map((Key) => ({ Key })),
+            Quiet: true,
+          },
+        }),
+      )
+      deletedCount += keys.length
+    }
+
+    continuationToken = listing.IsTruncated ? listing.NextContinuationToken : undefined
+  } while (continuationToken)
+
+  return deletedCount
+}
+
+export async function deleteR2FileHandler(req: Request, res: Response): Promise<void> {
+  try {
+    const storagePath = normalizeStoragePath(req.query.path)
+    if (!storagePath) {
+      res.status(400).json({ error: 'Invalid storage path' })
+      return
+    }
+
+    await getR2Client().send(
+      new DeleteObjectCommand({
+        Bucket: R2_BUCKET!,
+        Key: objectKey(storagePath),
+      }),
+    )
+
+    res.json({ ok: true, storagePath })
+  } catch (err) {
+    console.error('[BBExtract] R2 delete error:', err)
+    res.status(isR2Configured() ? 500 : 503).json({
+      error: err instanceof Error ? err.message : 'Failed to delete from R2',
+    })
+  }
+}
+
+export async function deleteR2PrefixHandler(req: Request, res: Response): Promise<void> {
+  try {
+    const prefix = normalizeStoragePath(req.query.prefix)
+    if (!prefix) {
+      res.status(400).json({ error: 'Invalid storage prefix' })
+      return
+    }
+
+    const deletedCount = await deleteR2ObjectsByPrefix(prefix)
+    res.json({ ok: true, prefix, deletedCount })
+  } catch (err) {
+    console.error('[BBExtract] R2 prefix delete error:', err)
+    res.status(isR2Configured() ? 500 : 503).json({
+      error: err instanceof Error ? err.message : 'Failed to delete from R2',
     })
   }
 }

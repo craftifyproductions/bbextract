@@ -125,6 +125,10 @@ export interface ProcessedModel {
   status: 'processing' | 'done' | 'error'
   progress?: ProcessingStage
   error?: string
+  /** Set when the file came from a ZIP upload. */
+  sourceArchive?: string
+  /** Original entry path inside the source ZIP. */
+  originalPath?: string
 }
 
 /** Slim worker postMessage payload — rawText stays on the main thread. */

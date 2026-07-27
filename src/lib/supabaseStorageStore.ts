@@ -1,11 +1,13 @@
 import JSZip from 'jszip'
-import { downloadR2File, uploadR2File } from './api'
+import { deleteR2File, deleteR2Prefix, downloadR2File, uploadR2File } from './api'
 import { buildModelZip } from './buildZip'
 import { loadEnvSettings } from './envSettings'
 import { modelDataStore } from './modelDataStore'
 import { recordAuditEvent } from './auditLogStore'
 import type { SessionLogRecord } from './sessionLogger'
 import { getSupabaseClient } from './supabaseClient'
+import { buildGroupedAssetLocation, buildModelStorageRoot } from './modelAssetGrouping'
+import type { ShouldCancelUpload } from './uploadCancel'
 import type { DirectUploadAssetItem, ProcessedModel } from './types'
 
 export interface StoredExtractedFile {
@@ -170,11 +172,6 @@ function filenameFromPath(storagePath: string): string {
   return storagePath.split('/').pop() || storagePath
 }
 
-function archiveFolderName(asset: DirectUploadAssetItem): string {
-  const sourceName = asset.sourceArchive?.replace(/\.zip$/i, '') || 'direct_assets'
-  return sanitizePathPart(sourceName)
-}
-
 function r2BucketLabel(bucket: string): string {
   return `r2:${bucket}`
 }
@@ -302,79 +299,163 @@ async function buildFilesForModel(model: ProcessedModel): Promise<FileToUpload[]
   return files
 }
 
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback
+}
+
+const MAX_EXTRACTION_RUN_CONTENT_BYTES = 4 * 1024 * 1024
+
+/** Minimal run row required by extracted_files.run_id (full log save is best-effort). */
+export async function ensureExtractionRunForUpload(run: SessionLogRecord): Promise<void> {
+  const supabase = await getSupabaseClient()
+  if (!supabase) {
+    throw new Error('Supabase metadata store is unavailable')
+  }
+
+  let content = run.content
+  if (content.length > MAX_EXTRACTION_RUN_CONTENT_BYTES) {
+    content = `${content.slice(0, MAX_EXTRACTION_RUN_CONTENT_BYTES)}\n...[truncated for Supabase storage limit]`
+  }
+
+  const { error } = await supabase.from('extraction_runs').upsert(
+    {
+      id: run.id,
+      filename: run.filename,
+      created_at: run.createdAt,
+      user_email: run.userEmail ?? null,
+      file_count: run.fileCount,
+      success_count: run.successCount,
+      error_count: run.errorCount,
+      content,
+      source: 'browser',
+    },
+    { onConflict: 'id' },
+  )
+
+  if (error) throw new Error(error.message)
+}
+
+async function getAuthenticatedUserId(
+  supabase: NonNullable<Awaited<ReturnType<typeof getSupabaseClient>>>,
+): Promise<string> {
+  const { data, error } = await supabase.auth.getUser()
+  if (error) throw new Error(error.message)
+  if (!data.user) throw new Error('Sign in to Supabase before uploading files.')
+  return data.user.id
+}
+
 export async function uploadExtractedModelFiles(
   run: SessionLogRecord,
   models: ProcessedModel[],
-): Promise<UploadStorageResult> {
+  onModelUploaded?: (uploadedModels: number) => void,
+  shouldCancel?: ShouldCancelUpload,
+): Promise<ModelUploadStorageResult> {
   const supabase = await getSupabaseClient()
   if (!supabase) {
     throw new Error('Supabase metadata store is unavailable')
   }
 
   let uploaded = 0
+  let processedModels = 0
+  let savedModelCount = 0
+  const failures: UploadFailure[] = []
   const runFolder = `${formatStorageTimestamp(run.createdAt)}_${run.id.slice(0, 8)}`
+  const userId = await getAuthenticatedUserId(supabase)
+
+  await ensureExtractionRunForUpload(run)
 
   for (const model of models.filter((entry) => entry.status === 'done')) {
-    const files = await buildFilesForModel(model)
-    const modelPath = sanitizePathPart(model.folderName)
+    if (shouldCancel?.()) break
+
+    const modelBasePath = buildModelStorageRoot(runFolder, model)
     let modelZipPath: string | null = null
+    const fileErrors: string[] = []
 
-    for (const file of files) {
-      const filename = sanitizePathPart(file.filename)
-      const storagePath = `${runFolder}/${modelPath}/${file.kind}/${filename}`
-      if (file.kind === 'model_zip') modelZipPath = storagePath
+    try {
+      const files = await buildFilesForModel(model)
 
-      const uploadedFile = await uploadR2File(
-        storagePath,
-        file.blob,
-        file.blob.type || 'application/octet-stream',
-      )
+      for (const file of files) {
+        if (shouldCancel?.()) break
 
-      const { error: metadataError } = await supabase.from('extracted_files').upsert(
-        {
-          run_id: run.id,
-          user_email: run.userEmail ?? null,
-          model_name: model.metadata.name || model.folderName,
-          file_kind: file.kind,
-          filename: file.filename,
-          storage_bucket: r2BucketLabel(uploadedFile.bucket),
-          storage_path: uploadedFile.storagePath,
-          mime_type: uploadedFile.contentType || null,
-          size_bytes: uploadedFile.sizeBytes,
-        },
-        { onConflict: 'storage_bucket,storage_path' },
-      )
+        const filename = sanitizePathPart(file.filename)
+        const storagePath = `${modelBasePath}/${file.kind}/${filename}`
 
-      if (metadataError) throw new Error(metadataError.message)
-      uploaded += 1
+        try {
+          const uploadedFile = await uploadR2File(
+            storagePath,
+            file.blob,
+            file.blob.type || 'application/octet-stream',
+          )
+
+          const { error: metadataError } = await supabase.from('extracted_files').upsert(
+            {
+              run_id: run.id,
+              user_email: run.userEmail ?? null,
+              model_name: model.metadata.name || model.folderName,
+              file_kind: file.kind,
+              filename: file.filename,
+              storage_bucket: r2BucketLabel(uploadedFile.bucket),
+              storage_path: uploadedFile.storagePath,
+              mime_type: uploadedFile.contentType || null,
+              size_bytes: uploadedFile.sizeBytes,
+            },
+            { onConflict: 'storage_bucket,storage_path' },
+          )
+
+          if (metadataError) throw new Error(metadataError.message)
+
+          if (file.kind === 'model_zip') modelZipPath = uploadedFile.storagePath
+          uploaded += 1
+        } catch (fileErr) {
+          fileErrors.push(`${file.filename}: ${errorMessage(fileErr, 'upload failed')}`)
+        }
+      }
+
+      // Only register the model once its archive is actually stored, otherwise the
+      // hash-based duplicate check would block a retry of a model that has no data.
+      if (model.fileHash && modelZipPath) {
+        const { error: modelError } = await supabase.from('extracted_models').upsert(
+          {
+            run_id: run.id,
+            user_id: userId,
+            user_email: run.userEmail ?? null,
+            model_name: model.metadata.name || model.folderName,
+            original_filename: model.originalFilename,
+            file_hash: model.fileHash,
+            folder_name: model.folderName,
+            original_size_bytes: model.originalSizeBytes,
+            extracted_size_bytes: model.extractedSizeBytes,
+            element_count: model.summary.elementCount,
+            bone_count: model.summary.boneCount,
+            texture_count: model.summary.textureCount,
+            animation_count: model.summary.animationCount,
+            model_zip_path: modelZipPath,
+          },
+          { onConflict: 'file_hash' },
+        )
+
+        if (modelError) {
+          fileErrors.push(`model record: ${modelError.message}`)
+        } else {
+          savedModelCount += 1
+        }
+      } else if (!modelZipPath) {
+        fileErrors.push('model archive was not stored, so the model was not registered')
+      }
+    } catch (modelErr) {
+      fileErrors.push(errorMessage(modelErr, 'Unknown storage error'))
     }
 
-    if (model.fileHash) {
-      const { error: modelError } = await supabase.from('extracted_models').upsert(
-        {
-          run_id: run.id,
-          user_email: run.userEmail ?? null,
-          model_name: model.metadata.name || model.folderName,
-          original_filename: model.originalFilename,
-          file_hash: model.fileHash,
-          folder_name: model.folderName,
-          original_size_bytes: model.originalSizeBytes,
-          extracted_size_bytes: model.extractedSizeBytes,
-          element_count: model.summary.elementCount,
-          bone_count: model.summary.boneCount,
-          texture_count: model.summary.textureCount,
-          animation_count: model.summary.animationCount,
-          model_zip_path: modelZipPath,
-        },
-        { onConflict: 'file_hash' },
-      )
-
-      if (modelError) throw new Error(modelError.message)
+    if (fileErrors.length > 0) {
+      failures.push({ name: model.originalFilename, message: fileErrors.join('; ') })
     }
+
+    processedModels += 1
+    onModelUploaded?.(processedModels)
   }
 
   window.dispatchEvent(new CustomEvent('bbextract:storage-updated'))
-  return { uploadedCount: uploaded, metadataSaved: true }
+  return { uploadedCount: uploaded, metadataSaved: true, failures, savedModelCount }
 }
 
 export interface UploadedDirectAsset {
@@ -382,17 +463,30 @@ export interface UploadedDirectAsset {
   storagePath: string
 }
 
+export interface UploadFailure {
+  name: string
+  message: string
+}
+
 export interface UploadStorageResult {
   uploadedCount: number
   metadataSaved: boolean
+  failures: UploadFailure[]
+}
+
+export interface ModelUploadStorageResult extends UploadStorageResult {
+  savedModelCount: number
 }
 
 export async function uploadDirectAssetFiles(
   run: SessionLogRecord,
   assets: DirectUploadAssetItem[],
+  models: ProcessedModel[] = [],
   onUploaded?: (asset: UploadedDirectAsset) => void,
+  onSettled?: () => void,
+  shouldCancel?: ShouldCancelUpload,
 ): Promise<UploadStorageResult> {
-  if (assets.length === 0) return { uploadedCount: 0, metadataSaved: true }
+  if (assets.length === 0) return { uploadedCount: 0, metadataSaved: true, failures: [] }
 
   const supabase = await getSupabaseClient()
   if (!supabase) {
@@ -400,38 +494,47 @@ export async function uploadDirectAssetFiles(
   }
 
   const runFolder = `${formatStorageTimestamp(run.createdAt)}_${run.id.slice(0, 8)}`
+  const failures: UploadFailure[] = []
   let uploaded = 0
 
+  await ensureExtractionRunForUpload(run)
+
   for (const asset of assets) {
-    const archivePath = archiveFolderName(asset)
-    const filename = sanitizePathPart(asset.file.name)
-    const storagePath = `${runFolder}/${archivePath}/${asset.assetKind}/${filename}`
+    if (shouldCancel?.()) break
+
+    const { storagePath, modelName } = buildGroupedAssetLocation(runFolder, asset, models)
     const contentType = asset.file.type || 'application/octet-stream'
 
-    const uploadedFile = await uploadR2File(storagePath, asset.file, contentType)
+    try {
+      const uploadedFile = await uploadR2File(storagePath, asset.file, contentType)
 
-    const { error: metadataError } = await supabase.from('extracted_files').upsert(
-      {
-        run_id: run.id,
-        user_email: run.userEmail ?? null,
-        model_name: archivePath,
-        file_kind: asset.assetKind,
-        filename: asset.file.name,
-        storage_bucket: r2BucketLabel(uploadedFile.bucket),
-        storage_path: uploadedFile.storagePath,
-        mime_type: uploadedFile.contentType,
-        size_bytes: uploadedFile.sizeBytes,
-      },
-      { onConflict: 'storage_bucket,storage_path' },
-    )
+      const { error: metadataError } = await supabase.from('extracted_files').upsert(
+        {
+          run_id: run.id,
+          user_email: run.userEmail ?? null,
+          model_name: modelName,
+          file_kind: asset.assetKind,
+          filename: asset.file.name,
+          storage_bucket: r2BucketLabel(uploadedFile.bucket),
+          storage_path: uploadedFile.storagePath,
+          mime_type: uploadedFile.contentType,
+          size_bytes: uploadedFile.sizeBytes,
+        },
+        { onConflict: 'storage_bucket,storage_path' },
+      )
 
-    if (metadataError) throw new Error(metadataError.message)
-    uploaded += 1
-    onUploaded?.({ item: asset, storagePath: uploadedFile.storagePath })
+      if (metadataError) throw new Error(metadataError.message)
+      uploaded += 1
+      onUploaded?.({ item: asset, storagePath: uploadedFile.storagePath })
+    } catch (err) {
+      failures.push({ name: asset.file.name, message: errorMessage(err, 'upload failed') })
+    } finally {
+      onSettled?.()
+    }
   }
 
   window.dispatchEvent(new CustomEvent('bbextract:storage-updated'))
-  return { uploadedCount: uploaded, metadataSaved: true }
+  return { uploadedCount: uploaded, metadataSaved: true, failures }
 }
 
 async function listStoredFileRows(limit: number): Promise<StoredExtractedFile[]> {
@@ -448,6 +551,348 @@ async function listStoredFileRows(limit: number): Promise<StoredExtractedFile[]>
 
   if (error) throw new Error(error.message)
   return (data as ExtractedFileRow[]).map(rowToStoredFile)
+}
+
+export interface StorageUsage {
+  usedBytes: number
+  fileCount: number
+  modelCount: number
+  textureCount: number
+  animationCount: number
+  elementCount: number
+  boneCount: number
+  jsonCount: number
+  geometryCount: number
+  metadataCount: number
+  summaryCount: number
+  rawModelCount: number
+}
+
+const EMPTY_STORAGE_USAGE: StorageUsage = {
+  usedBytes: 0,
+  fileCount: 0,
+  modelCount: 0,
+  textureCount: 0,
+  animationCount: 0,
+  elementCount: 0,
+  boneCount: 0,
+  jsonCount: 0,
+  geometryCount: 0,
+  metadataCount: 0,
+  summaryCount: 0,
+  rawModelCount: 0,
+}
+
+function parseStorageUsageRow(row: {
+  used_bytes?: number | string | null
+  file_count?: number | string | null
+  texture_count?: number | string | null
+  animation_count?: number | string | null
+  model_count?: number | string | null
+  element_count?: number | string | null
+  bone_count?: number | string | null
+  json_count?: number | string | null
+  geometry_count?: number | string | null
+  metadata_count?: number | string | null
+  summary_count?: number | string | null
+  raw_model_count?: number | string | null
+}): StorageUsage {
+  return {
+    usedBytes: Number(row.used_bytes ?? 0),
+    fileCount: Number(row.file_count ?? 0),
+    textureCount: Number(row.texture_count ?? 0),
+    animationCount: Number(row.animation_count ?? 0),
+    modelCount: Number(row.model_count ?? 0),
+    elementCount: Number(row.element_count ?? 0),
+    boneCount: Number(row.bone_count ?? 0),
+    jsonCount: Number(row.json_count ?? 0),
+    geometryCount: Number(row.geometry_count ?? 0),
+    metadataCount: Number(row.metadata_count ?? 0),
+    summaryCount: Number(row.summary_count ?? 0),
+    rawModelCount: Number(row.raw_model_count ?? 0),
+  }
+}
+
+function mergeStorageUsage(primary: StorageUsage, fallback: StorageUsage): StorageUsage {
+  return {
+    usedBytes: Math.max(primary.usedBytes, fallback.usedBytes),
+    fileCount: Math.max(primary.fileCount, fallback.fileCount),
+    modelCount: Math.max(primary.modelCount, fallback.modelCount),
+    textureCount: Math.max(primary.textureCount, fallback.textureCount),
+    animationCount: Math.max(primary.animationCount, fallback.animationCount),
+    elementCount: Math.max(primary.elementCount, fallback.elementCount),
+    boneCount: Math.max(primary.boneCount, fallback.boneCount),
+    jsonCount: Math.max(primary.jsonCount, fallback.jsonCount),
+    geometryCount: Math.max(primary.geometryCount, fallback.geometryCount),
+    metadataCount: Math.max(primary.metadataCount, fallback.metadataCount),
+    summaryCount: Math.max(primary.summaryCount, fallback.summaryCount),
+    rawModelCount: Math.max(primary.rawModelCount, fallback.rawModelCount),
+  }
+}
+
+async function countStoredModelsPaginated(): Promise<number> {
+  const supabase = await getSupabaseClient()
+  if (!supabase) return 0
+
+  const pageSize = 1000
+  let offset = 0
+  let modelCount = 0
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('extracted_models')
+      .select('id')
+      .range(offset, offset + pageSize - 1)
+
+    if (error) throw new Error(error.message)
+    if (!data || data.length === 0) break
+
+    modelCount += data.length
+    if (data.length < pageSize) break
+    offset += pageSize
+  }
+
+  return modelCount
+}
+
+async function countStoredModelZipFilesPaginated(): Promise<number> {
+  const supabase = await getSupabaseClient()
+  if (!supabase) return 0
+
+  const pageSize = 1000
+  let offset = 0
+  let modelZipCount = 0
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('extracted_files')
+      .select('id')
+      .eq('file_kind', 'model_zip')
+      .range(offset, offset + pageSize - 1)
+
+    if (error) throw new Error(error.message)
+    if (!data || data.length === 0) break
+
+    modelZipCount += data.length
+    if (data.length < pageSize) break
+    offset += pageSize
+  }
+
+  return modelZipCount
+}
+
+/** Backfill extracted_models rows for model archives already stored in extracted_files. */
+export async function repairExtractedModelsRegistry(): Promise<number> {
+  const supabase = await getSupabaseClient()
+  if (!supabase) return 0
+
+  const userId = await getAuthenticatedUserId(supabase).catch(() => null)
+  if (!userId) return 0
+
+  let repaired = 0
+  let offset = 0
+  const pageSize = 500
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('extracted_files')
+      .select('run_id, user_email, model_name, filename, storage_path')
+      .eq('file_kind', 'model_zip')
+      .range(offset, offset + pageSize - 1)
+
+    if (error) throw new Error(error.message)
+    if (!data || data.length === 0) break
+
+    for (const row of data) {
+      const { data: existing, error: lookupError } = await supabase
+        .from('extracted_models')
+        .select('id')
+        .eq('model_zip_path', row.storage_path)
+        .maybeSingle()
+
+      if (lookupError) throw new Error(lookupError.message)
+      if (existing) continue
+
+      const { error: insertError } = await supabase.from('extracted_models').upsert(
+        {
+          run_id: row.run_id,
+          user_id: userId,
+          user_email: row.user_email,
+          model_name: row.model_name,
+          original_filename: row.filename,
+          file_hash: `registry:${row.storage_path}`,
+          folder_name: row.model_name,
+          model_zip_path: row.storage_path,
+        },
+        { onConflict: 'file_hash' },
+      )
+
+      if (!insertError) repaired += 1
+    }
+
+    if (data.length < pageSize) break
+    offset += pageSize
+  }
+
+  return repaired
+}
+
+async function sumModelRegistryStats(): Promise<Pick<StorageUsage, 'elementCount' | 'boneCount'>> {
+  const supabase = await getSupabaseClient()
+  if (!supabase) return { elementCount: 0, boneCount: 0 }
+
+  const pageSize = 1000
+  let offset = 0
+  let elementCount = 0
+  let boneCount = 0
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('extracted_models')
+      .select('element_count, bone_count')
+      .range(offset, offset + pageSize - 1)
+
+    if (error) throw new Error(error.message)
+    if (!data || data.length === 0) break
+
+    for (const row of data) {
+      elementCount += row.element_count ?? 0
+      boneCount += row.bone_count ?? 0
+    }
+
+    if (data.length < pageSize) break
+    offset += pageSize
+  }
+
+  return { elementCount, boneCount }
+}
+
+async function sumStorageUsagePaginated(): Promise<StorageUsage> {
+  const supabase = await getSupabaseClient()
+  if (!supabase) return EMPTY_STORAGE_USAGE
+
+  const pageSize = 1000
+  let offset = 0
+  let usedBytes = 0
+  let fileCount = 0
+  let textureCount = 0
+  let animationCount = 0
+  let jsonCount = 0
+  let geometryCount = 0
+  let metadataCount = 0
+  let summaryCount = 0
+  let rawModelCount = 0
+  let modelZipCount = 0
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('extracted_files')
+      .select('size_bytes, file_kind, storage_path')
+      .range(offset, offset + pageSize - 1)
+
+    if (error) throw new Error(error.message)
+    if (!data || data.length === 0) break
+
+    for (const row of data) {
+      fileCount += 1
+      usedBytes += row.size_bytes ?? 0
+
+      switch (row.file_kind) {
+        case 'texture':
+          textureCount += 1
+          break
+        case 'animation':
+          animationCount += 1
+          break
+        case 'json':
+          jsonCount += 1
+          break
+        case 'geometry':
+          geometryCount += 1
+          break
+        case 'metadata':
+          metadataCount += 1
+          break
+        case 'summary':
+          summaryCount += 1
+          break
+        case 'raw_model':
+          rawModelCount += 1
+          break
+        case 'model_zip':
+          modelZipCount += 1
+          break
+        default:
+          break
+      }
+
+      if (row.file_kind !== 'animation' && row.storage_path?.includes('/animation/')) {
+        animationCount += 1
+      }
+    }
+
+    if (data.length < pageSize) break
+    offset += pageSize
+  }
+
+  const registryModelCount = await countStoredModelsPaginated()
+  const registryStats = await sumModelRegistryStats()
+
+  return {
+    usedBytes,
+    fileCount,
+    textureCount,
+    animationCount,
+    jsonCount,
+    geometryCount,
+    metadataCount,
+    summaryCount,
+    rawModelCount,
+    modelCount: Math.max(registryModelCount, modelZipCount),
+    elementCount: registryStats.elementCount,
+    boneCount: registryStats.boneCount,
+  }
+}
+
+/** Totals from extracted_files / extracted_models (database source of truth). */
+export async function getStorageUsage(): Promise<StorageUsage> {
+  const supabase = await getSupabaseClient()
+  if (!supabase) return EMPTY_STORAGE_USAGE
+
+  let usage = await sumStorageUsagePaginated()
+
+  const registryModelCount = await countStoredModelsPaginated()
+  const modelZipCount = await countStoredModelZipFilesPaginated()
+  if (registryModelCount < modelZipCount) {
+    await repairExtractedModelsRegistry()
+    usage = await sumStorageUsagePaginated()
+  }
+
+  const { data, error } = await supabase.rpc('bbextract_storage_usage')
+  if (!error && data) {
+    const row = (Array.isArray(data) ? data[0] : data) as
+      | {
+          used_bytes?: number | string | null
+          file_count?: number | string | null
+          texture_count?: number | string | null
+          animation_count?: number | string | null
+          model_count?: number | string | null
+          element_count?: number | string | null
+          bone_count?: number | string | null
+          json_count?: number | string | null
+          geometry_count?: number | string | null
+          metadata_count?: number | string | null
+          summary_count?: number | string | null
+          raw_model_count?: number | string | null
+        }
+      | undefined
+
+    if (row) {
+      usage = mergeStorageUsage(parseStorageUsageRow(row), usage)
+    }
+  }
+
+  return usage
 }
 
 export async function listStoredExtractedFiles(
@@ -731,6 +1176,108 @@ export async function renameStoredFolder(
   }
 
   window.dispatchEvent(new CustomEvent('bbextract:storage-updated'))
+}
+
+function folderPrefix(folderPath: string): string {
+  return folderPath.endsWith('/') ? folderPath : `${folderPath}/`
+}
+
+function filesInFolder(folderPath: string, files: StoredExtractedFile[]): StoredExtractedFile[] {
+  const prefix = folderPrefix(folderPath)
+  return files.filter((file) => file.storagePath.startsWith(prefix))
+}
+
+async function deleteExtractedFileMetadata(
+  supabase: NonNullable<Awaited<ReturnType<typeof getSupabaseClient>>>,
+  file: Pick<StoredExtractedFile, 'storageBucket' | 'storagePath' | 'fileKind'>,
+): Promise<void> {
+  const { error: fileError } = await supabase
+    .from('extracted_files')
+    .delete()
+    .eq('storage_bucket', file.storageBucket)
+    .eq('storage_path', file.storagePath)
+  if (fileError) throw new Error(fileError.message)
+
+  if (file.fileKind === 'model_zip') {
+    const { error: modelError } = await supabase
+      .from('extracted_models')
+      .delete()
+      .eq('model_zip_path', file.storagePath)
+    if (modelError) throw new Error(modelError.message)
+  }
+}
+
+async function deleteExtractedFolderMetadata(
+  supabase: NonNullable<Awaited<ReturnType<typeof getSupabaseClient>>>,
+  folderPath: string,
+): Promise<void> {
+  const prefix = folderPrefix(folderPath)
+
+  const { error: filesError } = await supabase
+    .from('extracted_files')
+    .delete()
+    .like('storage_path', `${prefix}%`)
+  if (filesError) throw new Error(filesError.message)
+
+  const { error: modelsError } = await supabase
+    .from('extracted_models')
+    .delete()
+    .like('model_zip_path', `${prefix}%`)
+  if (modelsError) throw new Error(modelsError.message)
+}
+
+export async function deleteStoredFile(file: StoredExtractedFile): Promise<void> {
+  if (isR2StoredFile(file)) {
+    await deleteR2File(file.storagePath)
+  } else {
+    const supabase = await getSupabaseClient()
+    if (!supabase) throw new Error('Supabase is unavailable')
+    const { error } = await supabase.storage.from(file.storageBucket).remove([file.storagePath])
+    if (error) throw new Error(error.message)
+  }
+
+  const supabase = await getSupabaseClient()
+  if (!supabase) throw new Error('Supabase metadata store is unavailable')
+  await deleteExtractedFileMetadata(supabase, file)
+
+  void recordAuditEvent('deleted_stored_file', file.filename, {
+    modelName: file.modelName,
+    fileKind: file.fileKind,
+    storagePath: file.storagePath,
+  })
+  window.dispatchEvent(new CustomEvent('bbextract:storage-updated'))
+}
+
+export async function deleteStoredFolder(
+  folderPath: string,
+  files: StoredExtractedFile[],
+): Promise<number> {
+  const matchingFiles = filesInFolder(folderPath, files)
+  const hasR2Files = matchingFiles.some(isR2StoredFile)
+  const legacyFiles = matchingFiles.filter((file) => !isR2StoredFile(file))
+
+  if (hasR2Files) {
+    await deleteR2Prefix(folderPath)
+  }
+
+  if (legacyFiles.length > 0) {
+    const supabase = await getSupabaseClient()
+    if (!supabase) throw new Error('Supabase is unavailable')
+    const { error } = await supabase.storage
+      .from(legacyFiles[0].storageBucket)
+      .remove(legacyFiles.map((file) => file.storagePath))
+    if (error) throw new Error(error.message)
+  }
+
+  const supabase = await getSupabaseClient()
+  if (!supabase) throw new Error('Supabase metadata store is unavailable')
+  await deleteExtractedFolderMetadata(supabase, folderPath)
+
+  void recordAuditEvent('deleted_stored_folder', folderPath, {
+    fileCount: matchingFiles.length,
+  })
+  window.dispatchEvent(new CustomEvent('bbextract:storage-updated'))
+  return matchingFiles.length
 }
 
 export async function readStoredTextFile(file: StoredExtractedFile): Promise<string> {

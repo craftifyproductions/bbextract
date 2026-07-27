@@ -6,11 +6,20 @@ export interface QueueInfo {
   total: number
 }
 
+export type UploadPhase = 'uploading'
+
+export interface UploadInfo {
+  phase: UploadPhase
+  current: number
+  total: number
+}
+
 type ProgressEntry = { stage: ProcessingStage } & ProcessingProgressDetail
 
 export function useProcessingProgress() {
   const [progressMap, setProgressMap] = useState<Record<string, ProgressEntry>>({})
   const [queueInfo, setQueueInfo] = useState<QueueInfo | null>(null)
+  const [uploadInfo, setUploadInfo] = useState<UploadInfo | null>(null)
   const [activeProcessingId, setActiveProcessingId] = useState<string | null>(null)
 
   const pendingRef = useRef<Map<string, ProgressEntry>>(new Map())
@@ -66,6 +75,14 @@ export function useProcessingProgress() {
     setActiveProcessingId(null)
   }, [])
 
+  const setUploadProgress = useCallback((current: number, total: number) => {
+    setUploadInfo(total > 0 ? { phase: 'uploading', current, total } : null)
+  }, [])
+
+  const clearUploadProgress = useCallback(() => {
+    setUploadInfo(null)
+  }, [])
+
   const getProgress = useCallback(
     (id: string) => progressMap[id],
     [progressMap],
@@ -80,13 +97,17 @@ export function useProcessingProgress() {
   return {
     progressMap,
     queueInfo,
+    uploadInfo,
     activeProcessingId,
     setActiveProcessingId,
     setProgress,
     clearProgress,
     setQueuePosition,
     clearQueue,
+    setUploadProgress,
+    clearUploadProgress,
     getProgress,
     isProcessing: queueInfo !== null,
+    isUploading: uploadInfo !== null,
   }
 }

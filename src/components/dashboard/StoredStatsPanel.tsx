@@ -1,41 +1,90 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import {
-  listStoredExtractedFiles,
-  listStoredExtractedModels,
-  type StoredExtractedFile,
-  type StoredExtractedModel,
-} from '../../lib/supabaseStorageStore'
+import { getStorageUsage, type StorageUsage } from '../../lib/supabaseStorageStore'
 import { getSupabaseClient } from '../../lib/supabaseClient'
 import { formatBytes } from '../../lib/stats'
-import type { ProcessedModel } from '../../lib/types'
-import { StatsBar } from '../layout/StatsBar'
 import { Button } from '../ui/Button'
 
-interface StoredStatsPanelProps {
-  models: ProcessedModel[]
+const EMPTY_STORAGE_USAGE: StorageUsage = {
+  usedBytes: 0,
+  fileCount: 0,
+  modelCount: 0,
+  textureCount: 0,
+  animationCount: 0,
+  elementCount: 0,
+  boneCount: 0,
+  jsonCount: 0,
+  geometryCount: 0,
+  metadataCount: 0,
+  summaryCount: 0,
+  rawModelCount: 0,
 }
 
-interface SavedStats {
-  modelCount: number
-  textureCount: number
-  animationCount: number
-  fileCount: number
-  totalBytes: number
-}
+const SAVED_LIBRARY_CATEGORIES: Array<{
+  key: keyof StorageUsage
+  label: string
+  hoverClass: string
+}> = [
+  {
+    key: 'modelCount',
+    label: 'Saved Models',
+    hoverClass: 'hover:bg-blue-500/12 hover:border-blue-400/35',
+  },
+  {
+    key: 'elementCount',
+    label: 'Elements',
+    hoverClass: 'hover:bg-emerald-500/12 hover:border-emerald-400/35',
+  },
+  {
+    key: 'boneCount',
+    label: 'Bones',
+    hoverClass: 'hover:bg-orange-500/12 hover:border-orange-400/35',
+  },
+  {
+    key: 'textureCount',
+    label: 'Textures',
+    hoverClass: 'hover:bg-violet-500/12 hover:border-violet-400/35',
+  },
+  {
+    key: 'animationCount',
+    label: 'Animations',
+    hoverClass: 'hover:bg-pink-500/12 hover:border-pink-400/35',
+  },
+  {
+    key: 'jsonCount',
+    label: 'JSON',
+    hoverClass: 'hover:bg-cyan-500/12 hover:border-cyan-400/35',
+  },
+  {
+    key: 'geometryCount',
+    label: 'Geometry',
+    hoverClass: 'hover:bg-teal-500/12 hover:border-teal-400/35',
+  },
+  {
+    key: 'metadataCount',
+    label: 'Metadata',
+    hoverClass: 'hover:bg-indigo-500/12 hover:border-indigo-400/35',
+  },
+  {
+    key: 'summaryCount',
+    label: 'Summary',
+    hoverClass: 'hover:bg-yellow-500/12 hover:border-yellow-400/35',
+  },
+  {
+    key: 'rawModelCount',
+    label: 'Raw Models',
+    hoverClass: 'hover:bg-rose-500/12 hover:border-rose-400/35',
+  },
+  {
+    key: 'fileCount',
+    label: 'Files',
+    hoverClass: 'hover:bg-slate-400/12 hover:border-slate-300/35',
+  },
+]
 
-function computeSavedStats(models: StoredExtractedModel[], files: StoredExtractedFile[]): SavedStats {
-  return {
-    modelCount: models.length,
-    textureCount: files.filter((file) => file.fileKind === 'texture').length,
-    animationCount: files.filter((file) => file.fileKind === 'animation').length,
-    fileCount: files.length,
-    totalBytes: files.reduce((sum, file) => sum + (file.sizeBytes ?? 0), 0),
-  }
-}
+const STORED_BYTES_HOVER_CLASS = 'hover:bg-amber-500/12 hover:border-amber-400/35'
 
-export function StoredStatsPanel({ models }: StoredStatsPanelProps) {
-  const [storedModels, setStoredModels] = useState<StoredExtractedModel[]>([])
-  const [storedFiles, setStoredFiles] = useState<StoredExtractedFile[]>([])
+export function StoredStatsPanel() {
+  const [storageUsage, setStorageUsage] = useState<StorageUsage>(EMPTY_STORAGE_USAGE)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -43,12 +92,8 @@ export function StoredStatsPanel({ models }: StoredStatsPanelProps) {
     setLoading(true)
     setError(null)
     try {
-      const [nextModels, nextFiles] = await Promise.all([
-        listStoredExtractedModels(),
-        listStoredExtractedFiles(),
-      ])
-      setStoredModels(nextModels)
-      setStoredFiles(nextFiles)
+      const usage = await getStorageUsage()
+      setStorageUsage(usage)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load stats')
     } finally {
@@ -85,11 +130,6 @@ export function StoredStatsPanel({ models }: StoredStatsPanelProps) {
           { event: '*', schema: 'public', table: 'extracted_files' },
           () => void refresh(),
         )
-        .on(
-          'postgres_changes',
-          { event: '*', schema: 'storage', table: 'objects' },
-          () => void refresh(),
-        )
         .subscribe()
       removeChannel = () => {
         void client.removeChannel(channel)
@@ -105,58 +145,69 @@ export function StoredStatsPanel({ models }: StoredStatsPanelProps) {
     }
   }, [refresh])
 
-  const savedStats = useMemo(
-    () => computeSavedStats(storedModels, storedFiles),
-    [storedModels, storedFiles],
-  )
+  const storedBytesLabel = useMemo(() => {
+    if (loading) return '…'
+    return storageUsage.usedBytes ? formatBytes(storageUsage.usedBytes) : '0 B'
+  }, [loading, storageUsage.usedBytes])
 
   return (
-    <div className="space-y-4 sm:space-y-6">
-      <section className="rounded border border-border bg-surface-elevated/30 p-3 sm:p-4">
-        <div className="mb-4">
-          <h2 className="text-sm font-semibold text-text-primary">Current Session</h2>
-          <p className="mt-1 text-xs text-text-secondary">Local extraction stats for this browser tab.</p>
-        </div>
-        <StatsBar models={models} />
-      </section>
-
-      <section className="rounded border border-border bg-surface-elevated/30 p-3 sm:p-4">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 max-sm:items-start">
-          <div>
-            <h2 className="text-sm font-semibold text-text-primary">Saved Library</h2>
-            <p className="mt-1 text-xs text-text-secondary">Only totals and quick stats.</p>
-          </div>
-          <Button variant="secondary" size="sm" disabled={loading} className="max-sm:w-full" onClick={() => void refresh()}>
-            Refresh
-          </Button>
-        </div>
-
-        {error ? (
-          <p className="rounded border border-red-500/40 bg-surface-base/60 p-3 text-sm text-red-300">
-            Failed to load stats: {error}
+    <section className="rounded border border-border bg-surface-elevated/30 p-3 sm:p-4">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3 max-sm:items-start">
+        <div>
+          <h2 className="text-sm font-semibold text-text-primary">Saved Library</h2>
+          <p className="mt-1 text-xs text-text-secondary">
+            Database totals for all persisted models and files.
           </p>
-        ) : (
-          <div className="grid grid-cols-2 gap-3 xl:grid-cols-5">
-            <StatCard label="Saved Models" value={loading ? '…' : savedStats.modelCount} />
-            <StatCard label="Textures" value={loading ? '…' : savedStats.textureCount} />
-            <StatCard label="Animations" value={loading ? '…' : savedStats.animationCount} />
-            <StatCard label="Files" value={loading ? '…' : savedStats.fileCount} />
+        </div>
+        <Button variant="secondary" size="sm" disabled={loading} className="max-sm:w-full" onClick={() => void refresh()}>
+          Refresh
+        </Button>
+      </div>
+
+      {error ? (
+        <p className="rounded border border-red-500/40 bg-surface-base/60 p-3 text-sm text-red-300">
+          Failed to load stats: {error}
+        </p>
+      ) : (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6">
+          {SAVED_LIBRARY_CATEGORIES.map(({ key, label, hoverClass }) => (
             <StatCard
-              label="Size"
-              value={loading ? '…' : savedStats.totalBytes ? formatBytes(savedStats.totalBytes) : '0 B'}
+              key={key}
+              label={label}
+              value={loading ? '…' : storageUsage[key].toLocaleString()}
+              hoverClass={hoverClass}
             />
-          </div>
-        )}
-      </section>
-    </div>
+          ))}
+          <StatCard
+            label="Stored"
+            value={storedBytesLabel}
+            hint="Total from database"
+            hoverClass={STORED_BYTES_HOVER_CLASS}
+          />
+        </div>
+      )}
+    </section>
   )
 }
 
-function StatCard({ label, value }: { label: string; value: number | string }) {
+function StatCard({
+  label,
+  value,
+  hint,
+  hoverClass,
+}: {
+  label: string
+  value: number | string
+  hint?: string
+  hoverClass?: string
+}) {
   return (
-    <div className="rounded border border-border bg-surface-base/70 p-3 sm:p-4">
+    <div
+      className={`rounded border border-border bg-surface-base/70 p-3 transition-colors duration-200 sm:p-4 ${hoverClass ?? ''}`}
+    >
       <p className="text-[10px] uppercase tracking-[0.16em] text-text-secondary sm:text-xs sm:tracking-[0.18em]">{label}</p>
       <p className="mt-2 break-words font-mono text-2xl font-semibold text-text-primary sm:text-3xl">{value}</p>
+      {hint ? <p className="mt-1 text-[10px] text-text-secondary">{hint}</p> : null}
     </div>
   )
 }

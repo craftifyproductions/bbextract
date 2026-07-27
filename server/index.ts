@@ -22,7 +22,13 @@ import {
   saveLogHandler,
   syncManifestFromDisk,
 } from './logs.js'
-import { downloadR2FileHandler, healthR2Handler, uploadR2FileHandler } from './r2.js'
+import {
+  deleteR2FileHandler,
+  deleteR2PrefixHandler,
+  downloadR2FileHandler,
+  healthR2Handler,
+  uploadR2FileHandler,
+} from './r2.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const distPath = resolve(__dirname, '../dist')
@@ -93,7 +99,14 @@ app.use(
   }),
 )
 
-app.use('/api', apiLimiter)
+// R2 routes require auth and are used for bulk uploads — skip IP rate limits there.
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/r2')) {
+    next()
+    return
+  }
+  apiLimiter(req, res, next)
+})
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
@@ -106,6 +119,8 @@ app.get('/api/auth/session', sessionHandler)
 app.get('/api/r2/health', requireStorageAuth, healthR2Handler)
 app.put('/api/r2/file', requireStorageAuth, uploadR2FileHandler)
 app.get('/api/r2/file', requireStorageAuth, downloadR2FileHandler)
+app.delete('/api/r2/file', requireStorageAuth, deleteR2FileHandler)
+app.delete('/api/r2/prefix', requireStorageAuth, deleteR2PrefixHandler)
 
 app.get('/api/logs', requireAuth, listLogsHandler)
 app.post('/api/logs', requireAuth, saveLogHandler)

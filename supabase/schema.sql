@@ -278,6 +278,48 @@ create policy "bbextract_extracted_files_delete"
   on public.extracted_files for delete
   using (auth.uid() = user_id);
 
+-- Accurate stored-library totals (used by the storage bar and dashboard stats).
+create or replace function public.bbextract_storage_usage()
+returns table (
+  used_bytes bigint,
+  file_count bigint,
+  texture_count bigint,
+  animation_count bigint,
+  model_count bigint,
+  element_count bigint,
+  bone_count bigint,
+  json_count bigint,
+  geometry_count bigint,
+  metadata_count bigint,
+  summary_count bigint,
+  raw_model_count bigint
+)
+language sql
+stable
+security invoker
+set search_path = public
+as $$
+  select
+    coalesce(sum(ef.size_bytes), 0)::bigint as used_bytes,
+    count(ef.*)::bigint as file_count,
+    count(*) filter (where ef.file_kind = 'texture')::bigint as texture_count,
+    count(*) filter (
+      where ef.file_kind = 'animation' or ef.storage_path like '%/animation/%'
+    )::bigint as animation_count,
+    (select count(*)::bigint from public.extracted_models em)::bigint as model_count,
+    coalesce((select sum(em.element_count) from public.extracted_models em), 0)::bigint as element_count,
+    coalesce((select sum(em.bone_count) from public.extracted_models em), 0)::bigint as bone_count,
+    count(*) filter (where ef.file_kind = 'json')::bigint as json_count,
+    count(*) filter (where ef.file_kind = 'geometry')::bigint as geometry_count,
+    count(*) filter (where ef.file_kind = 'metadata')::bigint as metadata_count,
+    count(*) filter (where ef.file_kind = 'summary')::bigint as summary_count,
+    count(*) filter (where ef.file_kind = 'raw_model')::bigint as raw_model_count
+  from public.extracted_files ef;
+$$;
+
+revoke all on function public.bbextract_storage_usage() from public;
+grant execute on function public.bbextract_storage_usage() to authenticated;
+
 -- ---------------------------------------------------------------------------
 -- User activity audit log
 -- ---------------------------------------------------------------------------

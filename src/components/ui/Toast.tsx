@@ -3,7 +3,7 @@ import { useEffect } from 'react'
 export interface ToastMessage {
   id: string
   message: string
-  type: 'error' | 'success' | 'info'
+  type: 'error' | 'success' | 'info' | 'warning'
 }
 
 interface ToastProps {
@@ -15,6 +15,7 @@ const typeStyles = {
   error: 'border-red-500/40 bg-surface-elevated text-red-300',
   success: 'border-accent/40 bg-surface-elevated text-accent',
   info: 'border-border bg-surface-elevated text-text-primary',
+  warning: 'border-amber-500/40 bg-surface-elevated text-amber-200',
 }
 
 export function Toast({ toasts, onDismiss }: ToastProps) {

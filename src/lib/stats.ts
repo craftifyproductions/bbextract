@@ -86,5 +86,11 @@ export function computeAggregateStats(models: ProcessedModel[]): AggregateStats 
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+export function formatStorageCompact(bytes: number): string {
+  if (bytes < 1024 * 1024 * 1024) return formatBytes(bytes)
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }

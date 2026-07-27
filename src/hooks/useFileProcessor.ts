@@ -1,16 +1,19 @@
-import { useCallback, useRef } from 'react'
-import { checkR2Health } from '../lib/api'
+import { useCallback, useRef, useState } from 'react'
 import { recordAuditEvent } from '../lib/auditLogStore'
 import { sha256File } from '../lib/fileHash'
 import { persistSessionLog } from '../lib/logStore'
 import { processFileInWorker } from '../lib/processFileInWorker'
 import { createSessionLogger, type SessionLogger } from '../lib/sessionLogger'
-import { getSupabaseClient } from '../lib/supabaseClient'
 import {
+  ensureExtractionRunForUpload,
   findExistingModelHashes,
   uploadDirectAssetFiles,
   uploadExtractedModelFiles,
+  type UploadFailure,
 } from '../lib/supabaseStorageStore'
+import { UploadPreflightGate } from '../lib/uploadPreflight'
+import { UploadCancelGate } from '../lib/uploadCancel'
+import { duplicateSkipMessage, duplicateSkipReason } from '../lib/duplicateSkipMessages'
 import type {
   DirectUploadAssetItem,
   ExtractedTexture,
@@ -25,6 +28,7 @@ import type { useProcessingProgress } from './useProcessingProgress'
 export interface ProcessingError {
   filename: string
   message: string
+  severity?: 'error' | 'warning' | 'info'
 }
 
 interface QueuedFile {
@@ -36,45 +40,12 @@ interface QueuedFile {
   uploadBatchComplete?: boolean
 }
 
-const UPLOAD_PREFLIGHT_TABLES = ['extraction_runs', 'extracted_models', 'extracted_files'] as const
-
 async function yieldToMain(): Promise<void> {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
   if (typeof scheduler !== 'undefined' && typeof scheduler.yield === 'function') {
     await scheduler.yield()
   }
   await new Promise<void>((resolve) => setTimeout(resolve, 0))
-}
-
-async function assertUploadPersistenceReady(): Promise<void> {
-  const supabase = await getSupabaseClient()
-  if (!supabase) {
-    throw new Error('Supabase is not configured. Upload persistence is unavailable.')
-  }
-
-  const { data: sessionData, error: sessionError } = await supabase.auth.getSession()
-  if (sessionError) throw new Error(`Supabase session check failed: ${sessionError.message}`)
-  if (!sessionData.session) {
-    throw new Error('Sign in to Supabase before uploading files.')
-  }
-
-  const { data: userData, error: userError } = await supabase.auth.getUser()
-  if (userError) throw new Error(`Supabase session verification failed: ${userError.message}`)
-  if (!userData.user) {
-    throw new Error('Supabase session verification failed. Sign in again before uploading files.')
-  }
-
-  for (const table of UPLOAD_PREFLIGHT_TABLES) {
-    const { error } = await supabase.from(table).select('id').limit(1)
-    if (error) {
-      throw new Error(`Supabase ${table} table is not reachable: ${error.message}`)
-    }
-  }
-
-  const health = await checkR2Health()
-  if (!health.ok) {
-    throw new Error('Cloudflare R2 health check failed.')
-  }
 }
 
 function createProcessingPlaceholder(file: File, fileHash?: string): ProcessedModel {
@@ -172,6 +143,8 @@ type ProcessingProgressApi = Pick<
   | 'setQueuePosition'
   | 'clearQueue'
   | 'setActiveProcessingId'
+  | 'setUploadProgress'
+  | 'clearUploadProgress'
 >
 
 export function useFileProcessor(
@@ -199,6 +172,83 @@ export function useFileProcessor(
   const queuedHashesRef = useRef<Set<string>>(new Set())
   const finalizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingUploadBatchIdsRef = useRef<Set<string>>(new Set())
+  const preflightGateRef = useRef(new UploadPreflightGate())
+  const uploadCancelRef = useRef(new UploadCancelGate())
+  const isFinalizingRef = useRef(false)
+  const isUploadActiveRef = useRef(false)
+  const [isUploadActive, setIsUploadActive] = useState(false)
+
+  const isUploadCancelled = useCallback(() => uploadCancelRef.current.isCancelled, [])
+
+  const resetSessionAfterCancel = useCallback(() => {
+    isUploadActiveRef.current = false
+    setIsUploadActive(false)
+    sessionLoggerRef.current = null
+    batchFilesRef.current = []
+    completedModelsRef.current = []
+    directAssetsRef.current = []
+    queueRef.current = []
+    pendingUploadBatchIdsRef.current.clear()
+    queuedHashesRef.current.clear()
+    totalQueuedRef.current = 0
+    processedCountRef.current = 0
+    progressApi.clearQueue()
+    progressApi.clearUploadProgress()
+    preflightGateRef.current.reset()
+  }, [progressApi])
+
+  const beginUploadSession = useCallback(() => {
+    uploadCancelRef.current.reset()
+    isUploadActiveRef.current = true
+    setIsUploadActive(true)
+  }, [])
+
+  const cancelUpload = useCallback(() => {
+    const hasActiveWork =
+      isUploadActiveRef.current ||
+      queueRef.current.length > 0 ||
+      drainingRef.current ||
+      pendingUploadBatchIdsRef.current.size > 0 ||
+      sessionLoggerRef.current !== null
+
+    if (!hasActiveWork) return
+
+    uploadCancelRef.current.cancel()
+    if (finalizeTimerRef.current) {
+      clearTimeout(finalizeTimerRef.current)
+      finalizeTimerRef.current = null
+    }
+    queueRef.current = []
+    pendingUploadBatchIdsRef.current.clear()
+    directAssetsRef.current = []
+    queuedHashesRef.current.clear()
+    sessionLoggerRef.current?.warn('Upload cancelled by user')
+    consoleApi.warn('Upload cancelled by user')
+    void recordAuditEvent('upload_cancelled', 'Upload session')
+    resetSessionAfterCancel()
+  }, [consoleApi, resetSessionAfterCancel])
+
+  const shouldCancelUpload = useCallback(() => uploadCancelRef.current.isCancelled, [])
+
+  const reportPreflightFailure = useCallback(
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : 'Upload persistence preflight failed'
+      consoleApi.error(`Upload preflight failed — ${message}`)
+      onError({ filename: 'upload-preflight', message })
+      void recordAuditEvent('upload_preflight_failed', 'Storage', { message })
+      return false
+    },
+    [consoleApi, onError],
+  )
+
+  const prepareUpload = useCallback(async (): Promise<boolean> => {
+    try {
+      await preflightGateRef.current.ensureReady()
+      return true
+    } catch (err) {
+      return reportPreflightFailure(err)
+    }
+  }, [reportPreflightFailure])
 
   const filterDuplicateFiles = useCallback(
     async (items: ModelUploadItem[]): Promise<QueuedFile[]> => {
@@ -211,19 +261,22 @@ export function useFileProcessor(
       const uniqueFiles: QueuedFile[] = []
 
       for (const entry of hashedFiles) {
-        const duplicate =
-          existingHashes.has(entry.hash) ||
-          knownHashesRef.current.has(entry.hash) ||
+        const inLibrary = existingHashes.has(entry.hash)
+        const inZip =
+          batchHashes.has(entry.hash) ||
           queuedHashesRef.current.has(entry.hash) ||
-          batchHashes.has(entry.hash)
+          knownHashesRef.current.has(entry.hash)
 
-        if (duplicate) {
-          const message = `${entry.file.name} already exists and was skipped`
+        if (inLibrary || inZip) {
+          const reason = duplicateSkipReason(inLibrary)
+          const message = duplicateSkipMessage(entry.file.name, reason)
+          sessionLoggerRef.current?.warn(message)
           consoleApi.warn(message)
-          onError({ filename: entry.file.name, message })
+          onError({ filename: entry.file.name, message, severity: 'warning' })
           void recordAuditEvent('duplicate_upload_blocked', entry.file.name, {
             fileHash: entry.hash,
             size: entry.file.size,
+            reason,
           })
           continue
         }
@@ -250,8 +303,15 @@ export function useFileProcessor(
       finalizeTimerRef.current = null
     }
 
+    if (uploadCancelRef.current.isCancelled) {
+      resetSessionAfterCancel()
+      return
+    }
+
     const logger = sessionLoggerRef.current
     if (!logger) return
+
+    isFinalizingRef.current = true
 
     sessionLoggerRef.current = null
     batchFilesRef.current = []
@@ -271,24 +331,81 @@ export function useFileProcessor(
       }
     }
 
+    const reportUploadFailures = (label: string, failures: UploadFailure[]) => {
+      if (failures.length === 0) return
+      const summary = `${failures.length} ${label} could not be saved`
+      logger.warn(summary)
+      consoleApi.warn(summary)
+      for (const failure of failures) {
+        logger.assetFailure(failure.name, failure.message)
+        consoleApi.error(`  ${failure.name} — ${failure.message}`)
+      }
+      void recordAuditEvent('upload_items_failed', label, {
+        count: failures.length,
+        samples: failures.slice(0, 10),
+      })
+    }
+
+    const doneModelCount = completedModels.filter((model) => model.status === 'done').length
+    const totalUploadUnits = directAssets.length + doneModelCount
+    let uploadedUnits = 0
+    const reportUploadProgress = () => {
+      uploadedUnits += 1
+      progressApi.setUploadProgress(uploadedUnits, totalUploadUnits)
+    }
+    if (totalUploadUnits > 0) {
+      progressApi.setUploadProgress(0, totalUploadUnits)
+    }
+
     try {
       const initialRecord = logger.snapshot()
-      const initialLogTarget = await persistSessionLog(initialRecord, authenticated)
       let persistenceError: string | null = null
 
-      if (initialLogTarget !== 'supabase') {
-        const message = `Supabase log save did not succeed; saved to ${initialLogTarget} instead`
+      if (uploadCancelRef.current.isCancelled) {
+        logger.warn('Upload cancelled before persistence')
+        consoleApi.warn('Upload cancelled before persistence')
+        resetSessionAfterCancel()
+        return
+      }
+
+      try {
+        await ensureExtractionRunForUpload(initialRecord)
+      } catch (runErr) {
+        const message =
+          runErr instanceof Error
+            ? runErr.message
+            : 'Could not create extraction run in Supabase'
         logger.error(message)
         consoleApi.error(message)
         persistenceError = message
       }
 
+      // Full session log is best-effort — never block file/model uploads on it.
+      void persistSessionLog(initialRecord, authenticated).then((target) => {
+        if (target !== 'supabase') {
+          consoleApi.warn(`Session log saved to ${target} (full log may be incomplete)`)
+        }
+      })
+
+      const doneModels = completedModels.filter((model) => model.status === 'done')
+      if (doneModels.length === 0 && directAssets.length === 0) {
+        consoleApi.warn('Upload session finished with nothing to persist')
+      } else {
+        consoleApi.info(
+          `Persisting upload — ${doneModels.length} model(s), ${directAssets.length} direct asset(s)`,
+        )
+      }
+
+      // Asset and model persistence are independent: a failing texture must never
+      // stop the model registry (extracted_models) from being written.
       if (!persistenceError) {
         try {
           const directAssetResult = await uploadDirectAssetFiles(
             initialRecord,
             directAssets,
+            completedModels,
             ({ item, storagePath }) => {
+              if (uploadCancelRef.current.isCancelled) return
               logger.assetSuccess(item.file.name, {
                 kind: item.assetKind,
                 bytes: item.file.size,
@@ -298,7 +415,15 @@ export function useFileProcessor(
                 `Uploaded ${item.assetKind}: ${item.file.name}${formatArchiveDetail(item)} → ${storagePath}`,
               )
             },
+            reportUploadProgress,
+            shouldCancelUpload,
           )
+          if (uploadCancelRef.current.isCancelled) {
+            logger.warn('Upload cancelled during asset persistence')
+            consoleApi.warn('Upload cancelled during asset persistence')
+            resetSessionAfterCancel()
+            return
+          }
           const uploadedAssetCount = directAssetResult.uploadedCount
           if (uploadedAssetCount > 0) {
             void recordAuditEvent('uploaded_direct_zip_assets', `${uploadedAssetCount} file(s)`, {
@@ -310,12 +435,12 @@ export function useFileProcessor(
             logger.warn(message)
             consoleApi.warn(message)
           }
+          reportUploadFailures('ZIP asset(s)', directAssetResult.failures)
         } catch (assetErr) {
           console.error('[BBExtract] Failed to upload ZIP assets:', assetErr)
           const message = assetErr instanceof Error ? assetErr.message : 'Unknown storage error'
           logger.assetFailure('ZIP assets', message)
           consoleApi.error(`Failed to upload ZIP assets — ${message}`)
-          persistenceError = `ZIP asset persistence failed: ${message}`
           void recordAuditEvent('upload_zip_assets_failed', 'Storage', {
             runId: initialRecord.id,
             message,
@@ -325,16 +450,51 @@ export function useFileProcessor(
 
       if (!persistenceError) {
         try {
-          const extractedUploadResult = await uploadExtractedModelFiles(initialRecord, completedModels)
-          const uploadedCount = extractedUploadResult.uploadedCount
+          const extractedUploadResult = await uploadExtractedModelFiles(
+            initialRecord,
+            completedModels,
+            reportUploadProgress,
+            shouldCancelUpload,
+          )
+          if (uploadCancelRef.current.isCancelled) {
+            logger.warn('Upload cancelled during model persistence')
+            consoleApi.warn('Upload cancelled during model persistence')
+            resetSessionAfterCancel()
+            return
+          }
+          const { uploadedCount, savedModelCount, failures } = extractedUploadResult
           if (uploadedCount > 0) {
-            logger.info(`Saved ${uploadedCount} extracted model file(s)`)
-            consoleApi.info(`Saved ${uploadedCount} extracted file(s)`)
+            logger.info(
+              `Saved ${savedModelCount} model(s) and ${uploadedCount} extracted model file(s)`,
+            )
+            consoleApi.info(
+              `Saved ${savedModelCount} model(s) and ${uploadedCount} extracted file(s)`,
+            )
             void recordAuditEvent('uploaded_extracted_files', `${uploadedCount} file(s)`, {
               runId: initialRecord.id,
               modelCount: completedModels.length,
+              savedModelCount,
               fileCount: uploadedCount,
             })
+          } else if (doneModels.length > 0) {
+            const message = 'No extracted model files were saved to storage'
+            logger.warn(message)
+            consoleApi.warn(message)
+          }
+          if (doneModels.length > 0 && savedModelCount === 0) {
+            consoleApi.warn(
+              'Saved library model count will stay at 0 until at least one model archive is stored',
+            )
+          }
+          reportUploadFailures('model(s)', failures)
+          const failedModelNames = new Set(
+            extractedUploadResult.failures.map((failure) => failure.name),
+          )
+          for (const model of completedModels) {
+            if (!failedModelNames.has(model.originalFilename)) continue
+            const message = 'Model files could not be saved to storage'
+            commitModel(model.id, { status: 'error', progress: 'error', error: message })
+            onError({ filename: model.originalFilename, message })
           }
         } catch (storageErr) {
           console.error('[BBExtract] Failed to upload extracted files:', storageErr)
@@ -370,10 +530,34 @@ export function useFileProcessor(
       const message = err instanceof Error ? err.message : 'Failed to save session log'
       markCompletedModelsPersistenceFailed(message)
       consoleApi.error(`Upload persistence failed — ${message}`)
+    } finally {
+      isFinalizingRef.current = false
+      progressApi.clearUploadProgress()
+      preflightGateRef.current.reset()
+      sessionLoggerRef.current = null
+      batchFilesRef.current = []
+      completedModelsRef.current = []
+      directAssetsRef.current = []
+      isUploadActiveRef.current = false
+      setIsUploadActive(false)
     }
-  }, [authenticated, commitModel, consoleApi, onError, onLogSaved])
+  }, [
+    authenticated,
+    commitModel,
+    consoleApi,
+    onError,
+    onLogSaved,
+    progressApi,
+    resetSessionAfterCancel,
+    shouldCancelUpload,
+  ])
 
   const scheduleFinalizeSessionLog = useCallback(() => {
+    if (uploadCancelRef.current.isCancelled) {
+      resetSessionAfterCancel()
+      return
+    }
+
     if (pendingUploadBatchIdsRef.current.size > 0 || queueRef.current.length > 0 || drainingRef.current) {
       return
     }
@@ -386,7 +570,7 @@ export function useFileProcessor(
       finalizeTimerRef.current = null
       void finalizeSessionLog()
     }, 1500)
-  }, [finalizeSessionLog])
+  }, [finalizeSessionLog, resetSessionAfterCancel])
 
   const drainQueue = useCallback(async () => {
     if (drainingRef.current) return
@@ -396,6 +580,8 @@ export function useFileProcessor(
 
     try {
       while (queueRef.current.length > 0) {
+        if (uploadCancelRef.current.isCancelled) break
+
         const queued = queueRef.current.shift()!
         const { file } = queued
         processedCountRef.current += 1
@@ -418,6 +604,8 @@ export function useFileProcessor(
         }
 
         try {
+          if (uploadCancelRef.current.isCancelled) break
+
           const { assetTextures, ...result } = await processFileInWorker(
             file,
             placeholder.id,
@@ -449,7 +637,12 @@ export function useFileProcessor(
               message: result.error ?? `${file.name} failed to parse`,
             })
           } else {
-            const completedModel = { ...result, fileHash: queued.hash }
+            const completedModel = {
+              ...result,
+              fileHash: queued.hash,
+              sourceArchive: queued.sourceArchive,
+              originalPath: queued.originalPath,
+            }
             commitModel(placeholder.id, { ...completedModel, assetTextures })
             completedModelsRef.current.push(completedModel)
             knownHashesRef.current.add(queued.hash)
@@ -489,17 +682,35 @@ export function useFileProcessor(
       }
     } finally {
       drainingRef.current = false
+      if (uploadCancelRef.current.isCancelled) {
+        processedCountRef.current = 0
+        totalQueuedRef.current = 0
+        progressApi.clearQueue()
+        consoleApi.setBatchMode(false)
+        resetSessionAfterCancel()
+        return
+      }
       processedCountRef.current = 0
       totalQueuedRef.current = 0
       progressApi.clearQueue()
       consoleApi.setBatchMode(false)
       scheduleFinalizeSessionLog()
     }
-  }, [addModel, commitModel, consoleApi, onError, progressApi, scheduleFinalizeSessionLog])
+  }, [
+    addModel,
+    commitModel,
+    consoleApi,
+    onError,
+    progressApi,
+    resetSessionAfterCancel,
+    scheduleFinalizeSessionLog,
+  ])
 
   const processFiles = useCallback(
     async (items: UploadItem[]) => {
       if (items.length === 0) return
+
+      if (uploadCancelRef.current.isCancelled) return
 
       if (finalizeTimerRef.current) {
         clearTimeout(finalizeTimerRef.current)
@@ -520,14 +731,16 @@ export function useFileProcessor(
         (item): item is DirectUploadAssetItem => item.kind === 'asset',
       )
 
-      try {
-        await assertUploadPersistenceReady()
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Upload persistence preflight failed'
-        consoleApi.error(`Upload preflight failed — ${message}`)
-        onError({ filename: 'upload-preflight', message })
-        void recordAuditEvent('upload_preflight_failed', 'Storage', { message })
-        return
+      const wasIdle =
+        !sessionLoggerRef.current && totalQueuedRef.current === 0 && !drainingRef.current
+
+      if (wasIdle && !preflightGateRef.current.isReady) {
+        try {
+          await preflightGateRef.current.ensureReady()
+        } catch (err) {
+          reportPreflightFailure(err)
+          return
+        }
       }
 
       let uniqueFiles: QueuedFile[]
@@ -556,10 +769,13 @@ export function useFileProcessor(
         ...assetItems,
       ]
 
-      const wasIdle =
-        !sessionLoggerRef.current && totalQueuedRef.current === 0 && !drainingRef.current
-
       if (wasIdle) {
+        if (uploadCancelRef.current.isCancelled) return
+        if (!isUploadActiveRef.current) {
+          uploadCancelRef.current.reset()
+          isUploadActiveRef.current = true
+          setIsUploadActive(true)
+        }
         sessionLoggerRef.current = createSessionLogger(userEmail ?? undefined)
         batchFilesRef.current = [...allQueuedFiles]
         sessionLoggerRef.current.startBatch(allQueuedFiles)
@@ -607,8 +823,24 @@ export function useFileProcessor(
         scheduleFinalizeSessionLog()
       }
     },
-    [consoleApi, drainQueue, filterDuplicateFiles, onError, progressApi, scheduleFinalizeSessionLog, userEmail],
+    [
+      consoleApi,
+      drainQueue,
+      filterDuplicateFiles,
+      onError,
+      progressApi,
+      reportPreflightFailure,
+      scheduleFinalizeSessionLog,
+      userEmail,
+    ],
   )
 
-  return { processFiles }
+  return {
+    processFiles,
+    prepareUpload,
+    beginUploadSession,
+    cancelUpload,
+    isUploadActive,
+    isUploadCancelled,
+  }
 }
