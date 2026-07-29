@@ -1,6 +1,6 @@
 import { StorageBar } from './StorageBar'
 
-export type AppView = 'upload' | 'dashboard' | 'files'
+export type AppView = 'upload' | 'dashboard' | 'files' | 'generate'
 
 interface SidebarProps {
   activeView: AppView
@@ -13,6 +13,7 @@ interface SidebarProps {
 const navItems: { id: AppView; label: string }[] = [
   { id: 'upload', label: 'Upload' },
   { id: 'dashboard', label: 'Dashboard' },
+  { id: 'generate', label: 'Generate' },
   { id: 'files', label: 'Files' },
 ]
 
@@ -38,7 +39,7 @@ export function Sidebar({
       </div>
 
       <nav className="flex-1 px-3 py-4 max-md:px-2 max-md:py-2">
-        <ul className="space-y-0.5 max-md:grid max-md:grid-cols-3 max-md:gap-1 max-md:space-y-0">
+        <ul className="space-y-0.5 max-md:grid max-md:grid-cols-4 max-md:gap-1 max-md:space-y-0">
           {navItems.map((item) => {
             const isActive = activeView === item.id
             const showBadge = item.id === 'dashboard' && modelCount > 0
@@ -96,6 +97,19 @@ function NavIcon({ view, active }: { view: AppView; active: boolean }) {
           strokeWidth="1.25"
           strokeLinecap="square"
         />
+      </svg>
+    )
+  }
+  if (view === 'generate') {
+    return (
+      <svg width="20" height="20" viewBox="0 0 16 16" fill="none" aria-hidden>
+        <path
+          d="M8 2v3M8 11v3M2 8h3M11 8h3M4.2 4.2l2.1 2.1M9.7 9.7l2.1 2.1M11.8 4.2l-2.1 2.1M6.3 9.7l-2.1 2.1"
+          stroke={color}
+          strokeWidth="1.25"
+          strokeLinecap="square"
+        />
+        <circle cx="8" cy="8" r="1.5" stroke={color} strokeWidth="1.25" />
       </svg>
     )
   }

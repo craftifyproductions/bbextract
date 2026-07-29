@@ -9,6 +9,7 @@ import { EmptyState } from './components/dashboard/EmptyState'
 import { DashboardView } from './components/dashboard/DashboardView'
 import { ModelDetailPanel } from './components/detail/ModelDetailPanel'
 import { FileManagerView } from './components/files/FileManagerView'
+import { GenerateView } from './components/generate/GenerateView'
 import { Toast, type ToastMessage } from './components/ui/Toast'
 import { useAuth } from './hooks/useAuth'
 import { useConsole } from './hooks/useConsole'
@@ -237,6 +238,10 @@ function App() {
 
     if (activeView === 'dashboard') {
       return renderProtectedContent()
+    }
+
+    if (activeView === 'generate') {
+      return <GenerateView />
     }
 
     if (activeView === 'files') {
