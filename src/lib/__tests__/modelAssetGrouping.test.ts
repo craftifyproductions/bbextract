@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildGroupedAssetLocation, resolveModelFolderForAsset } from '../modelAssetGrouping'
-import type { DirectUploadAssetItem, ProcessedModel } from './types'
+import type { DirectUploadAssetItem, ProcessedModel } from '../types'
 
 function model(partial: Partial<ProcessedModel> & Pick<ProcessedModel, 'folderName' | 'originalFilename'>): ProcessedModel {
   return {

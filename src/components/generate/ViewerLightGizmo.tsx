@@ -257,7 +257,7 @@ export function ViewerLightGizmo({
       }
     }
 
-    const onDoubleClick = (event: PointerEvent) => {
+    const onDoubleClick = (event: MouseEvent) => {
       event.preventDefault()
       event.stopPropagation()
       const order: LightDirection[] = ['front', 'right', 'top', 'left']
