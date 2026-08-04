@@ -10,6 +10,7 @@ import { DashboardView } from './components/dashboard/DashboardView'
 import { ModelDetailPanel } from './components/detail/ModelDetailPanel'
 import { FileManagerView } from './components/files/FileManagerView'
 import { GenerateView } from './components/generate/GenerateView'
+import { RagLabelView } from './components/rag/RagLabelView'
 import { Toast, type ToastMessage } from './components/ui/Toast'
 import { useAuth } from './hooks/useAuth'
 import { useConsole } from './hooks/useConsole'
@@ -242,6 +243,10 @@ function App() {
 
     if (activeView === 'generate') {
       return <GenerateView />
+    }
+
+    if (activeView === 'rag') {
+      return <RagLabelView />
     }
 
     if (activeView === 'files') {

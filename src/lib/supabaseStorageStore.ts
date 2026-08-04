@@ -82,6 +82,8 @@ interface FileToUpload {
 
 interface ListStoredFilesOptions {
   verifyBucket?: boolean
+  /** Merge live Cloudflare R2 listing into the result (Files UI sync). */
+  includeR2?: boolean
 }
 
 interface StorageListObject {
@@ -895,6 +897,48 @@ export async function getStorageUsage(): Promise<StorageUsage> {
   return usage
 }
 
+async function listR2StoredFiles(limit: number): Promise<StoredExtractedFile[]> {
+  try {
+    const { listR2Files } = await import('./api')
+    const response = await listR2Files(limit)
+    const bucket = response.bucket ? r2BucketLabel(response.bucket) : 'r2:unknown'
+    return response.files.map((item) => {
+      const filename = filenameFromPath(item.storagePath)
+      const parts = item.storagePath.split('/').filter(Boolean)
+      const kindIdx = parts.findIndex((part) =>
+        [
+          'model_zip',
+          'raw_model',
+          'geometry',
+          'texture',
+          'animation',
+          'json',
+          'metadata',
+          'summary',
+          'element',
+        ].includes(part.toLowerCase()),
+      )
+      const modelName =
+        kindIdx > 0 ? parts[kindIdx - 1]! : inferModelNameFromPath(item.storagePath)
+      return {
+        id: `r2:${item.storagePath}`,
+        runId: parts[0] || 'bucket',
+        modelName,
+        fileKind: inferFileKind(filename, item.storagePath),
+        filename,
+        storageBucket: bucket,
+        storagePath: item.storagePath,
+        mimeType: null,
+        sizeBytes: item.sizeBytes,
+        createdAt: item.lastModified ?? new Date().toISOString(),
+      } satisfies StoredExtractedFile
+    })
+  } catch (err) {
+    console.warn('[BBExtract] R2 list failed; showing database rows only:', err)
+    return []
+  }
+}
+
 export async function listStoredExtractedFiles(
   limit = 500,
   options: ListStoredFilesOptions = {},
@@ -906,18 +950,31 @@ export async function listStoredExtractedFiles(
     console.warn('[BBExtract] Falling back to bucket listing:', err)
   }
 
-  if (!options.verifyBucket && tableFiles.length > 0) {
-    return tableFiles
+  const includeR2 = options.includeR2 !== false
+  const r2Files = includeR2 ? await listR2StoredFiles(limit) : []
+
+  if (options.verifyBucket) {
+    const bucketFiles = await listBucketObjectsRecursive('', limit)
+    const bucketPaths = new Set(bucketFiles.map((file) => file.storagePath))
+    const verifiedTableFiles = tableFiles.filter((file) => bucketPaths.has(file.storagePath))
+    const tablePaths = new Set(verifiedTableFiles.map((file) => file.storagePath))
+    const bucketOnlyFiles = bucketFiles.filter((file) => !tablePaths.has(file.storagePath))
+    const mergedLegacy = [...verifiedTableFiles, ...bucketOnlyFiles]
+    if (r2Files.length === 0) return mergedLegacy
+    const known = new Set(mergedLegacy.map((file) => file.storagePath))
+    return [...mergedLegacy, ...r2Files.filter((file) => !known.has(file.storagePath))]
   }
 
-  const bucketFiles = await listBucketObjectsRecursive('', limit)
-  if (!options.verifyBucket) return bucketFiles
+  if (tableFiles.length === 0 && r2Files.length === 0) {
+    return listBucketObjectsRecursive('', limit)
+  }
 
-  const bucketPaths = new Set(bucketFiles.map((file) => file.storagePath))
-  const verifiedTableFiles = tableFiles.filter((file) => bucketPaths.has(file.storagePath))
-  const tablePaths = new Set(verifiedTableFiles.map((file) => file.storagePath))
-  const bucketOnlyFiles = bucketFiles.filter((file) => !tablePaths.has(file.storagePath))
-  return [...verifiedTableFiles, ...bucketOnlyFiles]
+  if (r2Files.length === 0) return tableFiles
+
+  // Prefer DB metadata when both exist; add R2-only paths so Files matches Auto-label.
+  const tablePaths = new Set(tableFiles.map((file) => file.storagePath))
+  const r2Only = r2Files.filter((file) => !tablePaths.has(file.storagePath))
+  return [...tableFiles, ...r2Only]
 }
 
 async function listStoredModelRows(limit: number): Promise<StoredExtractedModel[]> {
@@ -1049,7 +1106,9 @@ export async function downloadStoredExtractedFile(file: StoredExtractedFile): Pr
   }
 
   const supabase = await getSupabaseClient()
-  if (!supabase) return
+  if (!supabase) {
+    throw new Error('Storage is not configured. Sign in and check Supabase settings.')
+  }
 
   const { data, error } = await supabase.storage
     .from(file.storageBucket)
@@ -1066,18 +1125,59 @@ export async function downloadStoredExtractedFile(file: StoredExtractedFile): Pr
   })
 }
 
+export type FolderZipProgress = {
+  phase: 'prepare' | 'download' | 'pack' | 'done'
+  current: number
+  total: number
+  filename?: string
+}
+
 export async function downloadStoredFolderZip(
   folderPath: string,
   files: StoredExtractedFile[],
+  options: { onProgress?: (progress: FolderZipProgress) => void } = {},
 ): Promise<void> {
-  const zip = new JSZip()
+  const { onProgress } = options
   const folderPrefix = folderPath.endsWith('/') ? folderPath : `${folderPath}/`
   const folderFiles = files.filter((file) => file.storagePath.startsWith(folderPrefix))
+  const downloadName = `${sanitizePathPart(filenameFromPath(folderPath) || 'folder')}.zip`
+
+  onProgress?.({ phase: 'prepare', current: 0, total: folderFiles.length })
+
+  if (folderFiles.length === 0) {
+    throw new Error('No files found in this folder to download.')
+  }
+
+  // Prefer the already-built model zip when present (much faster than re-packing).
+  const modelZips = folderFiles.filter((file) => file.fileKind === 'model_zip')
+  if (modelZips.length === 1) {
+    onProgress?.({
+      phase: 'download',
+      current: 1,
+      total: 1,
+      filename: modelZips[0].filename,
+    })
+    await downloadStoredExtractedFile(modelZips[0])
+    onProgress?.({ phase: 'done', current: 1, total: 1, filename: modelZips[0].filename })
+    return
+  }
+
   const needsSupabase = folderFiles.some((file) => !isR2StoredFile(file))
   const supabase = needsSupabase ? await getSupabaseClient() : null
-  if (needsSupabase && !supabase) return
+  if (needsSupabase && !supabase) {
+    throw new Error('Storage is not configured. Sign in and check Supabase settings.')
+  }
 
-  for (const file of folderFiles) {
+  const zip = new JSZip()
+  for (let index = 0; index < folderFiles.length; index += 1) {
+    const file = folderFiles[index]
+    onProgress?.({
+      phase: 'download',
+      current: index + 1,
+      total: folderFiles.length,
+      filename: file.filename,
+    })
+
     const data = isR2StoredFile(file)
       ? await downloadR2File(file.storagePath)
       : await supabase!.storage.from(file.storageBucket).download(file.storagePath).then((result) => {
@@ -1087,9 +1187,11 @@ export async function downloadStoredFolderZip(
     zip.file(file.storagePath.slice(folderPrefix.length), data)
   }
 
+  onProgress?.({ phase: 'pack', current: folderFiles.length, total: folderFiles.length })
   const blob = await zip.generateAsync({ type: 'blob' })
   const { saveAs } = await import('file-saver')
-  saveAs(blob, `${sanitizePathPart(filenameFromPath(folderPath) || 'folder')}.zip`)
+  saveAs(blob, downloadName)
+  onProgress?.({ phase: 'done', current: folderFiles.length, total: folderFiles.length })
   void recordAuditEvent('downloaded_stored_folder_zip', folderPath, {
     fileCount: folderFiles.length,
   })

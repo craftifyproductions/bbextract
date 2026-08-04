@@ -27,8 +27,17 @@ import {
   deleteR2PrefixHandler,
   downloadR2FileHandler,
   healthR2Handler,
+  listR2Handler,
   uploadR2FileHandler,
 } from './r2.js'
+import { generate2DHandler, generate2DStatusHandler } from './generate2d.js'
+import {
+  ragBatchCancelHandler,
+  ragBatchStartHandler,
+  ragBatchStatusHandler,
+  ragBatchSyncLimitsHandler,
+} from './ragBatch.js'
+import { ragLabelUploadHandler, ragVectorUploadHandler } from './ragLabelUpload.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const distPath = resolve(__dirname, '../dist')
@@ -65,7 +74,7 @@ app.use(
 
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 300,
+  limit: 600,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
 })
@@ -83,7 +92,6 @@ app.use(
     credentials: true,
   }),
 )
-app.use(express.json({ limit: '10mb' }))
 app.use(cookieParser())
 app.use(
   session({
@@ -99,9 +107,26 @@ app.use(
   }),
 )
 
+// Local RAG label upload needs raw bytes — register before the JSON body parser.
+app.post(
+  '/api/rag/label-upload',
+  requireStorageAuth,
+  express.raw({ type: () => true, limit: '80mb' }),
+  ragLabelUploadHandler,
+)
+
+// Larger JSON limit so local vector uploads can include base64 textures.
+app.use(express.json({ limit: '40mb' }))
+
 // R2 routes require auth and are used for bulk uploads — skip IP rate limits there.
+// RAG/generate status polls are lightweight and poll often — skip so the UI doesn't 429.
 app.use('/api', (req, res, next) => {
-  if (req.path.startsWith('/r2')) {
+  if (
+    req.path.startsWith('/r2') ||
+    req.path === '/rag/batch/status' ||
+    req.path === '/generate/2d/status' ||
+    req.path === '/health'
+  ) {
     next()
     return
   }
@@ -117,6 +142,7 @@ app.post('/api/auth/logout', logoutHandler)
 app.get('/api/auth/session', sessionHandler)
 
 app.get('/api/r2/health', requireStorageAuth, healthR2Handler)
+app.get('/api/r2/list', requireStorageAuth, listR2Handler)
 app.put('/api/r2/file', requireStorageAuth, uploadR2FileHandler)
 app.get('/api/r2/file', requireStorageAuth, downloadR2FileHandler)
 app.delete('/api/r2/file', requireStorageAuth, deleteR2FileHandler)
@@ -126,6 +152,15 @@ app.get('/api/logs', requireAuth, listLogsHandler)
 app.post('/api/logs', requireAuth, saveLogHandler)
 app.get('/api/logs/:id', requireAuth, getLogContentHandler)
 app.get('/api/logs/:id/download', requireAuth, downloadLogHandler)
+
+app.get('/api/generate/2d/status', generate2DStatusHandler)
+app.post('/api/generate/2d', generate2DHandler)
+
+app.get('/api/rag/batch/status', requireStorageAuth, ragBatchStatusHandler)
+app.post('/api/rag/batch/start', requireStorageAuth, ragBatchStartHandler)
+app.post('/api/rag/batch/cancel', requireStorageAuth, ragBatchCancelHandler)
+app.post('/api/rag/batch/sync-limits', requireStorageAuth, ragBatchSyncLimitsHandler)
+app.post('/api/rag/vector-upload', requireStorageAuth, ragVectorUploadHandler)
 
 if (isProduction) {
   app.use(express.static(distPath))
