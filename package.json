@@ -12,7 +12,11 @@
     "start": "cross-env NODE_ENV=production node dist-server/index.js",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "rag:build-models": "node scripts/build-model-json.mjs",
+    "rag:build-labels": "node scripts/build-label-json.mjs",
+    "rag:build-labels-ai": "node scripts/build-label-json-ai.mjs",
+    "rag:prepare": "node scripts/prepare-rag-folder.mjs"
   },
   "engines": {
     "node": ">=20"
@@ -20,6 +24,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1085.0",
     "@aws-sdk/lib-storage": "^3.1088.0",
+    "@google/genai": "^2.15.0",
     "@supabase/supabase-js": "^2.110.1",
     "@zip.js/zip.js": "^2.8.31",
     "cookie-parser": "^1.4.7",
