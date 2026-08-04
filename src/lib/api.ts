@@ -146,6 +146,25 @@ export async function checkR2Health(): Promise<R2HealthResponse> {
   return response.json() as Promise<R2HealthResponse>
 }
 
+export interface R2ListResponse {
+  ok: boolean
+  count: number
+  bucket?: string
+  files: Array<{
+    storagePath: string
+    sizeBytes: number
+    lastModified: string | null
+  }>
+}
+
+export async function listR2Files(limit = 20_000, prefix = ''): Promise<R2ListResponse> {
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  if (prefix) params.set('prefix', prefix)
+  const response = await binaryRequest(`/api/r2/list?${params.toString()}`)
+  return response.json() as Promise<R2ListResponse>
+}
+
 export async function uploadR2File(
   storagePath: string,
   blob: Blob,
