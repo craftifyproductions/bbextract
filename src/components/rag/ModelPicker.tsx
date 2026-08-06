@@ -97,7 +97,11 @@ function providerKey(modelId: string): ProviderIconKey {
   return 'openrouter'
 }
 
-function ProviderIcon({ modelId, size = 'md' }: { modelId: string; size?: 'sm' | 'md' }) {
+export function providerLabelForModel(modelId: string): string {
+  return PROVIDER_ICON[providerKey(modelId)].label
+}
+
+export function ProviderIcon({ modelId, size = 'md' }: { modelId: string; size?: 'sm' | 'md' }) {
   const key = providerKey(modelId)
   const meta = PROVIDER_ICON[key]
   const box = size === 'sm' ? 'h-7 w-7' : 'h-8 w-8'

@@ -103,6 +103,49 @@ export const MODEL_RATE_CAPS: Record<string, ModelRateCaps> = {
     source: 'nvidia-local-caps',
   },
   'google/gemma-3-27b-it': { rpm: 40, tpm: 100_000, rpd: 1_000, source: 'nvidia-local-caps' },
+
+  // Embedding models (OpenRouter + NVIDIA NIM)
+  'openai/text-embedding-3-small': {
+    rpm: 60,
+    tpm: 500_000,
+    rpd: 5_000,
+    source: 'openrouter-local-caps',
+  },
+  'qwen/qwen3-embedding-8b': { rpm: 40, tpm: 300_000, rpd: 3_000, source: 'openrouter-local-caps' },
+  'qwen/qwen3-embedding-4b': { rpm: 40, tpm: 300_000, rpd: 3_000, source: 'openrouter-local-caps' },
+  'voyageai/voyage-4-lite': { rpm: 40, tpm: 300_000, rpd: 3_000, source: 'openrouter-local-caps' },
+  'perplexity/pplx-embed-v1-0.6b': {
+    rpm: 40,
+    tpm: 300_000,
+    rpd: 3_000,
+    source: 'openrouter-local-caps',
+  },
+  'baai/bge-m3': { rpm: 40, tpm: 300_000, rpd: 3_000, source: 'openrouter-local-caps' },
+  'nvidia/nemotron-3-embed-1b:free': {
+    rpm: 20,
+    tpm: 100_000,
+    rpd: 500,
+    source: 'openrouter-local-caps',
+  },
+  'nvidia/llama-nemotron-embed-vl-1b-v2:free': {
+    rpm: 20,
+    tpm: 100_000,
+    rpd: 500,
+    source: 'openrouter-local-caps',
+  },
+  'nvidia/nv-embedqa-e5-v5': { rpm: 40, tpm: 100_000, rpd: 1_000, source: 'nvidia-local-caps' },
+  'nvidia/llama-3.2-nv-embedqa-1b-v2': {
+    rpm: 40,
+    tpm: 100_000,
+    rpd: 1_000,
+    source: 'nvidia-local-caps',
+  },
+  'nvidia/nv-embedqa-mistral-7b-v2': {
+    rpm: 30,
+    tpm: 80_000,
+    rpd: 800,
+    source: 'nvidia-local-caps',
+  },
 }
 
 function todayUtc(): string {

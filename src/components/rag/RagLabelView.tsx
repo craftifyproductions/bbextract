@@ -11,6 +11,7 @@ import {
   type LabeledLocalModel,
   type RagBatchState,
 } from '../../lib/ragBatchApi'
+import { setAutoEmbedEnabled } from '../../lib/ragEmbedApi'
 import { Button } from '../ui/Button'
 import { ModelPicker, type ModelPickerGroup } from './ModelPicker'
 
@@ -121,6 +122,29 @@ export function RagLabelView() {
     }
   }, [ragModel])
 
+  const toggleAutoEmbed = useCallback(
+    async (enabled: boolean) => {
+      setRagBusy(true)
+      setRagError(null)
+      try {
+        const response = await setAutoEmbedEnabled(enabled)
+        setRagState((prev) =>
+          prev ? { ...prev, autoEmbedEnabled: response.autoEmbedEnabled } : prev,
+        )
+        setStatus(
+          response.autoEmbedEnabled
+            ? 'Auto-embed after labeling: ON'
+            : 'Auto-embed after labeling: OFF',
+        )
+      } catch (err) {
+        setRagError(err instanceof Error ? err.message : 'Failed to update auto-embed')
+      } finally {
+        setRagBusy(false)
+      }
+    },
+    [],
+  )
+
   const startLabelBatch = useCallback(async () => {
     if (!ragState) return
     const remaining = ragState.rateLimit.rpdRemaining
@@ -142,6 +166,9 @@ export function RagLabelView() {
         'Writes only to vector-db (not extract folders)',
         'Skips models already labeled in vector-db (model.json + label.json)',
         ragDryRun ? 'Dry run: YES (no upload)' : 'Will upload model.json + label.json + texture into vector-db',
+        ragState.autoEmbedEnabled === false
+          ? 'Auto-embed: OFF'
+          : 'Auto-embed: ON (indexes into rag_models after each label)',
         '',
         'Continue?',
       ].join('\n'),
@@ -309,14 +336,11 @@ export function RagLabelView() {
 
   return (
     <div className="space-y-4 sm:space-y-5">
-      <div>
-        <h1 className="mb-1 text-2xl font-semibold text-text-primary max-sm:text-xl">RAG Label</h1>
-        <p className="text-base text-text-secondary max-sm:text-sm">
-          Generate <span className="font-mono">model.json</span> + AI{' '}
-          <span className="font-mono">label.json</span> from a local file, or batch-label models already
-          in R2.
-        </p>
-      </div>
+      <p className="text-sm text-text-secondary">
+        Generate <span className="font-mono">model.json</span> + AI{' '}
+        <span className="font-mono">label.json</span> from a local file, or batch-label models already in
+        R2.
+      </p>
 
       <div className="flex flex-wrap gap-2" role="tablist" aria-label="RAG label modes">
         <Button
@@ -344,7 +368,18 @@ export function RagLabelView() {
             choose Download or Upload to vector-db.
           </p>
 
-          <div className="mt-3 flex flex-wrap items-end gap-3">{modelSelect}</div>
+          <div className="mt-3 flex flex-wrap items-end gap-3">
+            {modelSelect}
+            <label className="mb-1 flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={ragState?.autoEmbedEnabled !== false}
+                disabled={localBusy || vectorBusy || ragBusy}
+                onChange={(event) => void toggleAutoEmbed(event.target.checked)}
+              />
+              Auto-embed on upload to vector-db
+            </label>
+          </div>
           {ragState &&
           ragState.availableModels?.find((m) => m.id === ragModel)?.provider === 'nvidia' &&
           !ragState.providers?.nvidia ? (
@@ -526,6 +561,19 @@ export function RagLabelView() {
                 onChange={(event) => setRagDryRun(event.target.checked)}
               />
               Dry run (no upload)
+            </label>
+            <label className="flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={ragState?.autoEmbedEnabled !== false}
+                disabled={
+                  ragBusy ||
+                  ragState?.status === 'running' ||
+                  ragState?.status === 'cancelling'
+                }
+                onChange={(event) => void toggleAutoEmbed(event.target.checked)}
+              />
+              Auto-embed after label
             </label>
             <Button
               variant="primary"

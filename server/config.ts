@@ -10,6 +10,8 @@ export const isProduction = process.env.NODE_ENV === 'production'
 export const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL
 export const SUPABASE_ANON_KEY =
   process.env.SUPABASE_ANON_KEY ?? process.env.VITE_SUPABASE_ANON_KEY
+/** Server-only. Used for RAG embedding upserts into rag_models. Never use VITE_. */
+export const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
 export const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID
 export const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID
@@ -68,6 +70,15 @@ export const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE ?? 'BBExtra
 
 /** Hard safety cap per button-started batch run. */
 export const RAG_BATCH_MAX_PER_RUN = Number(process.env.RAG_BATCH_MAX_PER_RUN ?? 100)
+
+/**
+ * OpenRouter embedding model + fixed dims matching supabase/rag_models.sql (vector(1536)).
+ * Models that cannot return 1536 dims will fail at embed time with a clear error.
+ */
+export const OPENROUTER_EMBEDDING_MODEL =
+  process.env.OPENROUTER_EMBEDDING_MODEL ?? 'openai/text-embedding-3-small'
+export const RAG_EMBEDDING_DIMS = Number(process.env.RAG_EMBEDDING_DIMS ?? 1536)
+export const RAG_EMBED_MAX_PER_RUN = Number(process.env.RAG_EMBED_MAX_PER_RUN ?? 500)
 
 /** Cloudflare Worker free image API — server-only. */
 export const CF_WORKER_IMAGE_URL = (

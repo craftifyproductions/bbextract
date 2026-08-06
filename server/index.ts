@@ -38,6 +38,13 @@ import {
   ragBatchSyncLimitsHandler,
 } from './ragBatch.js'
 import { ragLabelUploadHandler, ragVectorUploadHandler } from './ragLabelUpload.js'
+import {
+  ragEmbedAutoToggleHandler,
+  ragEmbedCancelHandler,
+  ragEmbedSearchHandler,
+  ragEmbedStartHandler,
+  ragEmbedStatusHandler,
+} from './ragEmbed.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const distPath = resolve(__dirname, '../dist')
@@ -124,6 +131,7 @@ app.use('/api', (req, res, next) => {
   if (
     req.path.startsWith('/r2') ||
     req.path === '/rag/batch/status' ||
+    req.path === '/rag/embed/status' ||
     req.path === '/generate/2d/status' ||
     req.path === '/health'
   ) {
@@ -161,6 +169,12 @@ app.post('/api/rag/batch/start', requireStorageAuth, ragBatchStartHandler)
 app.post('/api/rag/batch/cancel', requireStorageAuth, ragBatchCancelHandler)
 app.post('/api/rag/batch/sync-limits', requireStorageAuth, ragBatchSyncLimitsHandler)
 app.post('/api/rag/vector-upload', requireStorageAuth, ragVectorUploadHandler)
+
+app.get('/api/rag/embed/status', requireStorageAuth, ragEmbedStatusHandler)
+app.post('/api/rag/embed/start', requireStorageAuth, ragEmbedStartHandler)
+app.post('/api/rag/embed/cancel', requireStorageAuth, ragEmbedCancelHandler)
+app.post('/api/rag/embed/search', requireStorageAuth, ragEmbedSearchHandler)
+app.post('/api/rag/embed/auto', requireStorageAuth, ragEmbedAutoToggleHandler)
 
 if (isProduction) {
   app.use(express.static(distPath))

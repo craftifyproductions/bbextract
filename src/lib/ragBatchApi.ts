@@ -74,6 +74,7 @@ export interface RagBatchState {
   provider: 'openrouter' | 'nvidia'
   providers: { openrouter: boolean; nvidia?: boolean }
   configured: boolean
+  autoEmbedEnabled?: boolean
   vectorBucketConfigured?: boolean
   labelSchemaVersion?: number
   openrouterUsage?: {
