@@ -21,13 +21,20 @@ import {
 } from './r2.js'
 
 /** Bump when label fields/prompt change enough to warrant re-labeling. */
-export const LABEL_SCHEMA_VERSION = 2
+export const LABEL_SCHEMA_VERSION = 3
 import {
   estimateLabelTokens,
   getModelRateCaps,
   modelLabelRateLimiter,
   type LabelProvider,
 } from './ragRateLimit.js'
+import { isAutoEmbedEnabled, runAutoIndexVectorFolder } from './ragEmbed.js'
+import {
+  isRagCategory,
+  pruneTagList,
+  reconcileTaxonomy,
+  sanitizeEmbeddingTextForRag,
+} from './ragLabelNormalize.js'
 
 const FILE_KINDS = new Set([
   'model_zip',
@@ -41,7 +48,6 @@ const FILE_KINDS = new Set([
   'element',
 ])
 
-const CATEGORIES = ['character', 'prop', 'creature', 'environment'] as const
 const COMPLEXITIES = ['simple', 'medium', 'complex'] as const
 const CONFIDENCE_LEVELS = ['low', 'medium', 'high'] as const
 
@@ -900,9 +906,10 @@ function normalizeLabelResult(
   modelId: string,
   source: string,
 ): Record<string, unknown> {
-  const category = CATEGORIES.includes(raw.category as (typeof CATEGORIES)[number])
-    ? (raw.category as string)
-    : 'prop'
+  const rawCategory = String(raw.category || '')
+    .trim()
+    .toLowerCase()
+  const categoryValid = isRagCategory(rawCategory)
 
   const cubeCount =
     typeof analysis.cube_count === 'number'
@@ -918,29 +925,46 @@ function normalizeLabelResult(
   const confidence = CONFIDENCE_LEVELS.includes(raw.confidence as (typeof CONFIDENCE_LEVELS)[number])
     ? (raw.confidence as string)
     : 'medium'
-  const needsReview =
-    typeof raw.needs_review === 'boolean' ? raw.needs_review : confidence === 'low'
 
   const colorPalette = Array.isArray(raw.color_palette)
     ? raw.color_palette.map(String).map((c) => c.trim().toLowerCase()).filter(Boolean).slice(0, 8)
     : []
 
   const hasAnimation = Boolean(analysis.has_animation ?? raw.has_animation)
+  const folderHint = String(analysis.folder_name || analysis.model_name || '')
+  const reconciled = reconcileTaxonomy({
+    category: categoryValid ? rawCategory : 'prop',
+    subcategory:
+      raw.subcategory != null && String(raw.subcategory).trim()
+        ? String(raw.subcategory).trim().toLowerCase().replace(/\s+/g, '-')
+        : null,
+    folderHint,
+  })
+  const category = reconciled.category
+  const subcategory = reconciled.subcategory ?? undefined
   const description = sanitizeDescriptionForRag(String(raw.description || '').trim())
   const embeddingText = sanitizeEmbeddingTextForRag(
     String(raw.embedding_text || '').trim(),
     hasAnimation,
+    category,
+    subcategory,
+    folderHint,
   )
+
+  const styleTags = pruneTagList(raw.style_tags, 12)
+  const materialTags = pruneTagList(raw.material_tags, 8)
+  const needsReview =
+    (typeof raw.needs_review === 'boolean' ? raw.needs_review : confidence === 'low') ||
+    !categoryValid ||
+    reconciled.needsReview
 
   return {
     description,
     embedding_text: embeddingText,
     category,
-    ...(raw.subcategory ? { subcategory: String(raw.subcategory).trim() } : {}),
-    style_tags: Array.isArray(raw.style_tags) ? raw.style_tags.map(String).slice(0, 12) : [],
-    material_tags: Array.isArray(raw.material_tags)
-      ? raw.material_tags.map(String).slice(0, 8)
-      : [],
+    ...(subcategory ? { subcategory } : {}),
+    style_tags: styleTags,
+    material_tags: materialTags,
     color_palette: colorPalette,
     complexity,
     cube_count: cubeCount,
@@ -954,60 +978,15 @@ function normalizeLabelResult(
     _model: modelId,
     _source_folder: analysis.folder_name,
     _labeled_at: new Date().toISOString(),
+    ...(!categoryValid || reconciled.coerced
+      ? {
+          _category_coerced_from: rawCategory || null,
+          _subcategory_coerced_from:
+            raw.subcategory != null ? String(raw.subcategory) : null,
+          _taxonomy_reconciled: true,
+        }
+      : {}),
   }
-}
-
-/** Clip-name tokens that pollute RAG embeddings — strip from embedding_text. */
-const ANIMATION_CLIP_TOKENS = new Set([
-  'idle',
-  'walk',
-  'walking',
-  'run',
-  'running',
-  'sprint',
-  'attack',
-  'attacks',
-  'hurt',
-  'hit',
-  'death',
-  'die',
-  'swim',
-  'swimming',
-  'jump',
-  'sit',
-  'fly',
-  'flying',
-  'crouch',
-  'sneak',
-  'dance',
-  'sleep',
-  'eat',
-  'shoot',
-  'reload',
-  'aim',
-  'cast',
-  'spawn',
-  'despawn',
-  'loop',
-  'clips',
-  'animations',
-  'animation',
-  'anim',
-  'geckolib-idle',
-  'geckolib-walk',
-])
-
-function sanitizeEmbeddingTextForRag(text: string, hasAnimation: boolean): string {
-  const tokens = text
-    .toLowerCase()
-    .split(/\s+/)
-    .map((token) => token.replace(/[^a-z0-9_-]/g, ''))
-    .filter(Boolean)
-    .filter((token) => !ANIMATION_CLIP_TOKENS.has(token))
-    .filter((token) => token !== 'animated' && token !== 'static')
-
-  tokens.push(hasAnimation ? 'animated' : 'static')
-  return [...new Set(tokens)].join(' ').trim()
 }
 
 function sanitizeDescriptionForRag(text: string): string {
@@ -1040,8 +1019,8 @@ ${visionNote}
 Return ONLY a JSON object with these fields:
 - description (string)
 - embedding_text (string)
-- category (one of: character, prop, creature, environment)
-- subcategory (string, Minecraft-friendly when possible)
+- category (MUST be exactly one of: character, prop, creature, environment — no other values)
+- subcategory (kebab-case string from the taxonomy below)
 - style_tags (string array)
 - material_tags (string array)
 - color_palette (string array of dominant color words)
@@ -1057,6 +1036,15 @@ Field roles (important for later retrieval):
 - color_palette / complexity / cube_count (cube_count is filled server-side from geometry): filters for matching request style and detail level.
 - confidence / needs_review: triage flag — do not treat every AI label as equally trustworthy.
 
+Category decision rules (STRICT — pick exactly one; this drives filter_category):
+- character: playable or person-like figures — player skins (Steve/Alex), humanoid personas, role NPCs (warrior, mage, knight), civilian humans. NOT undead/monsters/animals.
+- creature: mobs and non-player fauna/monsters — zombie, skeleton, cow, wolf, dragon, golem, slime, hostile/passive mobs, animals, mythical beasts. Minecraft villager-type mobs → creature (subcategory villager), not character.
+- prop: handheld or placeable objects — weapons, furniture, tools, vehicles, machines, food, items, gadgets. NEVER use prop for buildings/fortresses/houses.
+- environment: world scenery and placeables that define a place — buildings, fortresses, castles, houses, towers, ruins, dungeons, terrain, caves, bridges, foliage, trees, biome pieces. A standalone fortress/building model = environment (usually subcategory structure, building, fortress, or castle).
+- Do NOT invent extra top-level categories (no weapon, vehicle, structure, item as category). Those are subcategories under prop or environment.
+- If unsure between character and creature: player skin / named human role → character; mob/species/undead/animal → creature. Set needs_review true when still ambiguous.
+- If unsure between prop and environment: can you hold/wear/place it as an object? → prop; is it a building or landscape piece? → environment.
+
 Rules for description (RAG-optimized):
 - 2–4 full sentences (50–110 words)
 - First sentence MUST state the specific identity (not a vague parent class). Examples:
@@ -1064,6 +1052,7 @@ Rules for description (RAG-optimized):
   - "A compact sci-fi handgun / pistol prop."
   - "A bipedal undead zombie hostile mob with torn clothing."
   - "A wooden dining chair furniture prop."
+  - "A stone fortress tower environment piece with battlements."
 - Focus ONLY on identity and appearance: subject, silhouette/parts, visual style, materials, colors, in-game use
 - Do NOT mention animations, clips, idle/walk/run/attack, or GeckoLib motion at all in description
 - Motion belongs in has_animation only (boolean). Description is for what the model looks like after retrieval.
@@ -1071,16 +1060,25 @@ Rules for description (RAG-optimized):
 - Do NOT only restate the folder name
 
 Rules for embedding_text (RAG search — most important field):
-- One dense line of 20–45 space-separated tokens (NOT a full paragraph, NOT a title)
-- Include: primary name, aliases/synonyms, category, subcategory, class synonyms, notable parts, style words, dominant colors, use-cases, Minecraft-ish terms
-- ALWAYS echo the specific subcategory token, plus useful parent/synonym tokens (e.g. subcategory handgun → also "pistol sidearm firearm gun weapon")
+- One dense line of 20–45 natural space-separated phrases (NOT a paragraph, NOT a title)
+- Write embedding_text the way a user would type a search query: spaces only — NEVER hyphens or underscores (e.g. "sniper rifle" not "sniper-rifle"; "hostile mob" not "hostile-mob"; "sci fi" not "sci-fi")
+- Include the chosen category token EXACTLY once (character OR prop OR creature OR environment). Do NOT include any other category word from that list
+- Include subcategory meaning as space-separated words (subcategory sniper-rifle → tokens "sniper" "rifle")
+- Also include: primary name, aliases/synonyms within the SAME class, notable parts, style words, dominant colors, use-cases
+- ALWAYS echo the specific class, plus useful same-family synonyms (handgun → also "pistol sidearm firearm gun"; never also "creature" or "environment")
+- MUST include distinctive tokens from folder_name / model name near the start (e.g. folder beacon_sniper → include "beacon sniper"; tnt_shotgun → "tnt shotgun"). Do not replace a sniper with generic "rifle" only
+- NEVER invent a different weapon class than the folder implies (do not label a shotgun folder as laser rifle)
+- Put the MOST distinctive identity tokens first, then style/color
 - Prefer concrete tokens users would search:
-  - "enchanted laser sniper-rifle rifle gun long-barrel scope sci-fi energy weapon handheld futuristic glowing blue prop combat"
-  - "zombie undead hostile-mob bipedal rotting green torn-cloth minecraft creature"
-  - "oak dining-chair furniture seat wooden brown prop household"
-- Include alternate phrasings when useful (e.g. "cow bovine cattle farm-animal passive-mob", "pistol handgun sidearm firearm")
+  - "beacon sniper sniper rifle scoped long barrel laser energy sci fi futuristic glowing blue prop combat"
+  - "tnt shotgun shotgun explosive wide barrel pump combat prop"
+  - "zombie undead hostile mob bipedal rotting green torn cloth creature"
+  - "oak dining chair furniture seat wooden brown prop household"
+  - "bastion light stone fortress tower battlements castle structure environment"
+- Include alternate phrasings when useful (e.g. "cow bovine cattle farm animal passive mob")
+- Do NOT include generic filler: model, asset, blockbench, minecraft, gaming, detailed, quality, nice, cool
 - Animation policy (strict): set has_animation correctly. In embedding_text include EXACTLY one of "animated" or "static" — NEVER clip names (idle, walk, run, attack, swim, death, jump, sit, etc.)
-- No punctuation except hyphens inside compound tokens; no sentences
+- No punctuation; no sentences
 
 Rules for color_palette:
 - 2–6 short color words (e.g. "blue", "white", "brown", "gold", "black")
@@ -1106,18 +1104,23 @@ Rules for confidence / needs_review:
 Other rules:
 - Prefer accurate category over guessing "prop"
 - subcategory MUST be the most specific valid class below — NEVER stop at a vague parent (weapon, gun, item, mob, creature, object, prop, furniture, vehicle, structure) when a child class is clear
-- Prefer kebab-case single tokens (sniper-rifle, passive-mob, dining-chair). If none fit, invent a short specific kebab-case type — do not fall back to "item"/"object" unless truly unknown
+- If folder/name contains sniper / shotgun / minigun / pistol / etc., subcategory MUST be that child class (sniper-rifle, shotgun, lmg, handgun…) — never bare "weapon" or "gun"
+- Prefer kebab-case single tokens for the subcategory FIELD only (sniper-rifle, passive-mob, dining-chair). embedding_text uses spaces for the same ideas
+- If none fit, invent a short specific kebab-case type — do not fall back to "item"/"object" unless truly unknown
 - Mirror clear name cues from folder/bones/textures into subcategory + description + embedding_text
 
 Subcategory taxonomy (pick ONE best match; use child class, not the parent header):
 
 category=character:
-- player, npc, villager, warrior, knight, soldier, archer, mage, wizard, witch, rogue, assassin, hunter, merchant, civilian, armored, caster, humanoid
+- player, npc, warrior, knight, soldier, archer, mage, wizard, witch, rogue, assassin, hunter, merchant, civilian, armored, caster, humanoid
 - Prefer role when clear (mage over humanoid; knight over armored)
+- Player-default skins (Alex, Steve, similar) → subcategory player
+- Do NOT use character for Minecraft villager mobs (those are creature)
 
 category=creature:
-- passive-mob, hostile-mob, boss, quadruped, bipedal, flying, aquatic, arthropod, undead, dragon, golem, elemental, slime, farm-animal, pet, mythical
+- passive-mob, hostile-mob, boss, quadruped, bipedal, flying, aquatic, arthropod, undead, dragon, golem, elemental, slime, farm-animal, pet, mythical, villager
 - Prefer species/role when clear (e.g. zombie, skeleton, creeper, enderman, spider, wolf, cat, horse, cow, pig, sheep, chicken, villager-golem) — species token IS a valid subcategory
+- Villager mobs and golems live here, not under character
 
 category=prop:
   Weapons / combat (never bare weapon/gun):
@@ -1133,14 +1136,15 @@ category=prop:
   Default prop fallback only if nothing above fits: item
 
 category=environment:
-- structure, building, house, castle, tower, ruins, dungeon, cave, terrain, rock, mountain, bridge, road, foliage, tree, bush, flower, grass, crop, water, lava, sky, weather, biome-prop
+- structure, building, house, fortress, castle, tower, ruins, dungeon, cave, terrain, rock, mountain, bridge, road, foliage, tree, bush, flower, grass, crop, water, lava, sky, weather, biome-prop
+- Standalone buildings/fortresses/castles → structure, building, fortress, or castle (NOT prop)
 
 Classification cues:
 - Firearms: long barrel + stock/scope ⇒ sniper-rifle/rifle; compact grip/slide ⇒ handgun/pistol; wide tube ⇒ shotgun; mid barrel + magazine ⇒ assault-rifle/smg
 - Mobs: undead cues ⇒ undead or species (zombie/skeleton); farm names ⇒ farm-animal or species; wings ⇒ flying; fins/swim bones ⇒ aquatic
 - Furniture: seat + legs ⇒ chair; flat top + legs ⇒ table; storage lid ⇒ chest/crate
-- Buildings / large static scenery ⇒ structure/building/house; plants ⇒ foliage/tree/bush/flower
-- style_tags: 3–8 specific tags; include class cues when visible (scoped, long-barrel, sidearm, bipedal, undead, wooden, ornate, etc.)
+- Buildings / large static scenery ⇒ environment + structure/building/fortress/house; plants ⇒ foliage/tree/bush/flower
+- style_tags: 3–8 specific visual tags only (scoped, long-barrel, sidearm, bipedal, undead, wooden, ornate). Never use gaming, minecraft, blockbench, 3d, model, asset, detailed, quality
 - Use bone/element/texture names as primary evidence. Animation names may only help set has_animation / category — never copy clip names into description or embedding_text
 - Ignore generic names like "cube", "bone", "group"`
 }
@@ -1477,6 +1481,17 @@ async function processModel(
       ` (${synced.paths.map((p) => p.split('/').pop()).join(', ')})`,
   )
 
+  const auto = await runAutoIndexVectorFolder(synced.folder)
+  if (auto.status === 'indexed') {
+    pushLog('info', `Auto-embedded → rag_models: ${auto.folder}`)
+  } else if (auto.status === 'disabled') {
+    pushLog('info', `Auto-embed OFF — not indexing ${auto.folder}`)
+  } else if (auto.status === 'skipped') {
+    pushLog('info', `Auto-embed skipped ${auto.folder}${auto.reason ? ` (${auto.reason})` : ''}`)
+  } else {
+    pushLog('warn', `Auto-embed failed ${auto.folder}${auto.reason ? `: ${auto.reason}` : ''}`)
+  }
+
   return 'done'
 }
 
@@ -1616,6 +1631,7 @@ function publicState(preferredModel?: string) {
   return {
     ...job,
     rateLimit,
+    autoEmbedEnabled: isAutoEmbedEnabled(),
     caps: {
       rpm: rateLimit.rpmLimit,
       tpm: rateLimit.tpmLimit,

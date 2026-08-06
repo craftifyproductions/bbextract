@@ -14,7 +14,7 @@ const navItems: { id: AppView; label: string }[] = [
   { id: 'upload', label: 'Upload' },
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'generate', label: 'Generate' },
-  { id: 'rag', label: 'RAG Label' },
+  { id: 'rag', label: 'RAG' },
   { id: 'files', label: 'Files' },
 ]
 

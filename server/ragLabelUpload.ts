@@ -422,6 +422,11 @@ export async function ragVectorUploadHandler(req: Request, res: Response): Promi
 
     const uploaded: string[] = []
     const failed: Array<{ name: string; error: string }> = []
+    const autoEmbedResults: Array<{
+      folder: string
+      status: string
+      reason?: string
+    }> = []
 
     for (const item of models) {
       const name = sanitizeName(String(item.name || 'model'))
@@ -451,6 +456,13 @@ export async function ragVectorUploadHandler(req: Request, res: Response): Promi
           },
         })
         uploaded.push(synced.folder)
+        const { runAutoIndexVectorFolder } = await import('./ragEmbed.js')
+        const auto = await runAutoIndexVectorFolder(synced.folder)
+        autoEmbedResults.push({
+          folder: synced.folder,
+          status: auto.status,
+          reason: auto.reason,
+        })
       } catch (error) {
         failed.push({
           name,
@@ -459,13 +471,25 @@ export async function ragVectorUploadHandler(req: Request, res: Response): Promi
       }
     }
 
+    const autoLines = autoEmbedResults.map((row) => {
+      if (row.status === 'indexed') return `Auto-embedded ${row.folder}`
+      if (row.status === 'disabled') return `Auto-embed OFF — skipped ${row.folder}`
+      if (row.status === 'skipped')
+        return `Auto-embed skipped ${row.folder}${row.reason ? ` (${row.reason})` : ''}`
+      return `Auto-embed failed ${row.folder}${row.reason ? `: ${row.reason}` : ''}`
+    })
+
     res.json({
       ok: failed.length === 0,
       uploaded,
       failed,
+      autoEmbed: autoEmbedResults,
       message:
         uploaded.length > 0
-          ? `Uploaded ${uploaded.length} model(s) to vector-db (json + texture when available): ${uploaded.join(', ')}`
+          ? [
+              `Uploaded ${uploaded.length} model(s) to vector-db: ${uploaded.join(', ')}`,
+              ...autoLines,
+            ].join(' · ')
           : 'No models uploaded to vector-db',
     })
   } catch (error) {
