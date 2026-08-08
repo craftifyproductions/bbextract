@@ -5,12 +5,20 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "dist-server",
-    "rootDir": "server",
+    "rootDir": ".",
     "strict": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "declaration": false
   },
-  "include": ["server/**/*"]
+  "include": [
+    "server/**/*",
+    "src/lib/aiModelGen/types.ts",
+    "src/lib/aiModelGen/prompts.ts",
+    "src/lib/aiModelGen/validate.ts",
+    "src/lib/aiModelGen/parse.ts",
+    "src/lib/aiModelGen/proceduralEgg.ts",
+    "src/lib/aiModelGen/server.ts"
+  ]
 }
